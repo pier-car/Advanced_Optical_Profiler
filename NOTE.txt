@@ -1,0 +1,314 @@
+🔬 REPORT DIAGNOSTICO — Advanced Optical Profiler v1.0
+Auditor: Senior QA Engineer & Software Architect Data: 2026-03-01 Scope: Analisi statica incrociata di tutti i 41 moduli Metodo: Review architetturale, analisi flusso dati, analisi threading, verifica firme Signal/Slot
+
+1. ANALISI DEI RISCHI E BUG NASCOSTI
+1.1 Integrazione Segnali/Slot
+🔴 BUG CONFERMATI
+B1 — MeasurementController.set_tolerance() potrebbe non esistere
+
+In main_window.py BLOCCO B:
+
+Python
+self._session_controller.tolerances_changed.connect(
+    self._measurement_controller.set_tolerance
+)
+Il SessionController emette tolerances_changed(object) con un ToleranceLimits. Ma il MeasurementController che hai nel tuo codebase — ha davvero un metodo set_tolerance()? Questo metodo non è mai stato generato da me, e il tuo file originale potrebbe non averlo. Se manca → crash silenzioso o AttributeError al primo cambio tolleranze.
+
+Verifica immediata:
+
+Code
+python -c "from controllers.measurement_controller import MeasurementController; print('set_tolerance' in dir(MeasurementController))"
+B2 — _on_record_changed firma ambigua
+
+In main_window.py:
+
+Python
+self._statistics_model.record_added.connect(self._on_record_changed)
+self._statistics_model.record_removed.connect(
+    lambda _: self._on_record_changed()
+)
+Il segnale record_added emette un oggetto (il record). Lo slot _on_record_changed è definito con _arg=None:
+
+Python
+def _on_record_changed(self, _arg=None):
+Questo funziona, MA: se il segnale record_added emette con una firma diversa (es. due argomenti, o nessuno), il collegamento fallisce silenziosamente in PySide6. Non crasha, semplicemente non viene chiamato.
+
+B3 — statistics_updated → StatisticsPanel.update_statistics mai connesso direttamente
+
+Ho verificato: in main_window.py il segnale statistics_model.statistics_updated è connesso a _on_stats_for_export, ma NON è connesso a statistics_panel.update_statistics(). Chi aggiorna il pannello statistiche? Presumibilmente il MeasurementController — ma se il tuo MeasurementController non ha questa connessione, il pannello statistiche resta vuoto per sempre.
+
+B4 — acquisition_controller.measure_captured firma
+
+La MainWindow connette:
+
+Python
+self._acquisition_controller.measure_captured.connect(
+    self._measurement_controller.on_measure_captured
+)
+self._acquisition_controller.measure_captured.connect(
+    self._session_controller.on_measure_captured
+)
+Il SessionController.on_measure_captured si aspetta un MeasurementResult. Ma il segnale measure_captured dal tuo AcquisitionController originale — emette davvero un MeasurementResult? O emette una tupla, o un dict? Se la firma non corrisponde → le misure non vengono registrate nella sessione.
+
+🟡 RISCHI PROBABILI
+R1 — _live_view._current_frame accesso diretto
+
+In calibration_wizard.py e main_window.py:
+
+Python
+frame = self._live_view._current_frame
+Accesso diretto a un attributo privato (_current_frame) che viene scritto dal thread del GrabWorker e letto dal main thread. Nessun lock. In pratica funziona perché Python ha il GIL e numpy.ndarray è un riferimento, ma se il GrabWorker sta scrivendo un nuovo frame mentre il main thread legge, potresti ottenere un frame parzialmente aggiornato (raro, ma possibile con array grandi).
+
+R2 — _acquisition_controller._is_grabbing e ._grab_worker accessi privati
+
+In main_window.py:
+
+Python
+if (self._acquisition_controller._is_grabbing
+        and self._acquisition_controller._grab_worker is not None):
+    self._acquisition_controller._grab_worker.frame_ready.connect(...)
+Viola l'incapsulamento. Se l'AcquisitionController rinomina questi attributi → crash. Dovrebbe esporre is_grabbing come property e connect_frame_feed(slot) come metodo pubblico.
+
+R3 — QDoubleSpinBox.valueChanged connesso a _on_nominal_changed
+
+In TestSetupDialog, _on_nominal_changed modifica _spin_usl e _spin_lsl con blockSignals. Ma se blockSignals fallisce (errore logico, o viene chiamato da un altro thread), si crea un loop infinito di valueChanged. Il rischio è basso ma esiste.
+
+1.2 Threading e Concorrenza
+🔴 CRITICO
+T1 — MetrologyEngine non è thread-safe
+
+Il GrabWorker (thread secondario) chiama metrology_engine.process_frame(). La MainWindow (main thread) chiama metrology_engine.set_calibration() quando l'operatore completa la calibrazione. Se l'operatore calibra mentre il GrabWorker sta processando un frame:
+
+Code
+Thread GrabWorker:  process_frame() → legge self._scale_mm_per_px
+Thread Main:        set_calibration() → scrive self._scale_mm_per_px
+In Python con GIL il rischio di corruzione è basso, ma il risultato della misura in corso potrebbe usare metà vecchia calibrazione e metà nuova. Una misura potrebbe avere il top edge calcolato con la vecchia scala e il bottom edge con la nuova.
+
+Mitigazione raccomandata: Aggiungere un threading.Lock in set_calibration() e process_frame(), o copiare i parametri di calibrazione in una struttura atomica.
+
+T2 — StabilityDetector accesso concorrente
+
+Lo StabilityDetector (se presente nel tuo AcquisitionController) mantiene un buffer circolare di misure. Il GrabWorker lo alimenta, ma il main thread potrebbe leggerlo (per il progress indicator). Se lo StabilityDetector non ha un lock interno, il buffer potrebbe essere in uno stato inconsistente durante la lettura.
+
+T3 — StatisticsModel thread-safety
+
+Il StatisticsModel viene scritto dal main thread (via Signal/Slot, che è safe), ma il get_snapshot() copia i dati. Se get_snapshot() viene chiamato da un thread secondario (improbabile ma possibile), il snapshot potrebbe essere inconsistente. Verifica che get_snapshot() sia chiamato solo dal main thread.
+
+🟡 MEDIO
+T4 — Timer di cleanup OSD nel LiveViewWidget
+
+_cleanup_osd_messages() modifica self._osd_messages (lista) che viene letta da paintEvent. Entrambi sono nel main thread (QTimer + paintEvent), quindi è safe. MA: se qualcuno chiama show_osd_message() da un thread secondario, la lista viene modificata concorrentemente. Verifica che show_osd_message sia sempre chiamato dal main thread o via Signal.
+
+1.3 Flusso Dati
+🔴 CRITICO
+D1 — SessionController non riceve dati anagrafici completi per il report
+
+Il SessionController._offer_export() crea un ReportGenerator con:
+
+Python
+generator = ReportGenerator(
+    operator_id=cfg.operator_id,
+    session_start=session.started_at,
+    calibration_scale=cfg.calibration_scale_mm_per_px,
+)
+Ma i dati anagrafici del prodotto (nome lotto, mescola, tipo bandina) sono nel session_name come stringa libera. Non c'è un campo strutturato per "Lotto", "Mescola", "Prodotto". Il report PDF mostra solo l'operatore e la data — non il nome della prova.
+
+Fix: Aggiungere title=config.session_name nella chiamata a export_pdf().
+
+D2 — quick_export() perde i timestamp
+
+In SessionController.quick_export():
+
+Python
+records.append({
+    "index": i,
+    "timestamp": "",  # ← VUOTO!
+    ...
+})
+L'export rapido (senza sessione) genera record senza timestamp. Il report PDF avrà la colonna Timestamp vuota per tutte le righe.
+
+D3 — record_dicts non include tutti i campi usati dal report
+
+Il MeasureRecord.to_dict() restituisce:
+
+Python
+{"index", "timestamp", "width_mm", "std_mm", "angle_deg",
+ "n_scanlines", "status", "source", "is_valid"}
+Ma il ReportGenerator.export_csv() cerca rec.get("n_scanlines", ""). Questo è coerente. Tuttavia il ReportGenerator.export_pdf() NON mostra n_scanlines nella tabella PDF — informazione persa nel report.
+
+🟡 MEDIO
+D4 — Calibration scale non propagata al SessionController all'avvio
+
+In main_window.__init__(), il SessionController è creato con calibration_scale default 0.0:
+
+Python
+self._session_controller = SessionController(
+    statistics_model=self._statistics_model,
+    sessions_dir=SESSIONS_DIR,
+    exports_dir=EXPORT_DIR,
+    parent=self,
+)
+Il set_calibration_scale() viene chiamato solo in _on_new_session() e _on_calibration_done(). Se l'operatore apre una sessione senza ricalibrare e la calibrazione era pre-esistente, il SessionController ha cal_scale=0.0 → il report mostra "Calibrazione: 0.000000 mm/px".
+
+Fix: Aggiungere nel costruttore di MainWindow, dopo la creazione del SessionController:
+
+Python
+if self._calibration_engine.is_calibrated:
+    self._session_controller.set_calibration_scale(
+        self._calibration_engine.scale_factor
+    )
+2. FUNZIONALITÀ INCOMPLETE O MANCANTI
+🔴 Mancanze Critiche
+#	Funzionalità	Stato	Impatto
+F1	Misura manuale → conversione mm	Il LiveViewWidget._complete_manual_measurement() imposta sempre distance_mm=0.0. Il metodo update_last_manual_measurement_mm() esiste ma nessuno lo chiama con la scala di calibrazione. Le misure manuali mostrano solo pixel, mai millimetri.	L'operatore non può misurare manualmente in mm
+F2	Histogram update	Il LiveViewWidget ha update_histogram() ma nel flusso del GrabWorker nessuno calcola e invia l'istogramma. L'istogramma resta vuoto.	Overlay istogramma sempre vuoto
+F3	Sharpness/Focus update	Il LiveViewWidget ha update_sharpness() ma nel flusso del GrabWorker nessuno calcola e invia la sharpness. La barra fuoco resta a zero.	Assistenza fuoco non funzionante
+F4	Edge overlay update	Il LiveViewWidget ha update_edge_overlay() ma dipende dal fatto che il GrabWorker emetta un segnale con i dati dei bordi. Se il tuo GrabWorker non emette edge_data_ready, l'overlay bordi non appare mai.	Nessuna visualizzazione bordi
+F5	MeasurementController.activate()	Chiamato in _on_toggle_grabbing(True). Se il tuo MeasurementController originale non ha questo metodo → crash.	Crash all'avvio del live
+🟡 Mancanze Medie
+#	Funzionalità	Stato
+F6	ImageProcessor non integrato	core/image_processor.py è stato generato ma nessun altro modulo lo importa o lo usa. La pipeline di pre-processing non è collegata al flusso di acquisizione.
+F7	CalibrationController non integrato	controllers/calibration_controller.py è stato generato ma la MainWindow usa ancora la logica di calibrazione inline (_on_calibrate, _on_calibration_done). Il controller è orfano.
+F8	CameraControlPanel, FocusAssistWidget, StatusBarWidget, VisualToolsPanel non integrati	Tutti generati come widget standalone ma la MainWindow non li usa — ha i propri widget inline. Sono codice morto.
+F9	Export PDF/CSV dalla sidebar	I pulsanti _btn_export_pdf e _btn_export_csv chiamano entrambi _on_quick_export() che apre lo stesso dialog. L'utente non può scegliere direttamente PDF vs CSV dal pulsante — deve scegliere nel dialog. Non è un bug, ma l'UX suggerisce che i pulsanti facciano cose diverse.
+F10	Undo misura	TestSession.remove_last_record() esiste ma nessuna UI lo chiama. L'operatore non può annullare l'ultima misura.
+🟢 Mancanze Minori
+#	Funzionalità	Stato
+F11	manual_measure_tool.py	File generato ma mai importato da nessun modulo. È una versione standalone della logica manuale che è già nel LiveViewWidget. Codice duplicato.
+F12	Tests	test_calibration.py e test_statistics_model.py usano fixture da conftest.py che importano MeasurementRecord da core.statistics_model — ma la classe nel tuo file potrebbe avere un nome diverso o campi diversi. I test potrebbero non girare.
+F13	validators.py	Generato ma mai chiamato da nessun dialog o controller. Nessuna validazione input è attiva.
+3. PIANO D'AZIONE PRIORITIZZATO (TRIAGE)
+🔴 P0 — BLOCCANTI (risolvere prima del collaudo)
+#	Azione	File	Effort
+P0.1	Verificare esistenza MeasurementController.set_tolerance() e aggiungerlo se manca	controllers/measurement_controller.py	15 min
+P0.2	Verificare firma measure_captured signal — deve emettere MeasurementResult	controllers/acquisition_controller.py	10 min
+P0.3	Verificare esistenza MeasurementController.activate()	controllers/measurement_controller.py	5 min
+P0.4	Connettere statistics_model.statistics_updated → statistics_panel.update_statistics (se non fatto dal MeasurementController)	views/main_window.py o controllers/measurement_controller.py	10 min
+P0.5	Propagare calibration_scale al SessionController all'avvio se calibrazione pre-esistente	views/main_window.py __init__	2 min
+P0.6	Aggiungere title=session_name alla chiamata export_pdf() nel SessionController	controllers/session_controller.py	2 min
+P0.7	Aggiungere lock in MetrologyEngine.set_calibration() e process_frame()	core/metrology_engine.py	20 min
+🟡 P1 — UX/METROLOGIA (risolvere per il primo utilizzo reale)
+#	Azione	File	Effort
+P1.1	Collegare misura manuale → conversione mm usando scala calibrazione	views/main_window.py + live_view_widget.py	30 min
+P1.2	Calcolare e inviare istogramma dal GrabWorker al LiveView	controllers/acquisition_controller.py	20 min
+P1.3	Calcolare e inviare sharpness dal GrabWorker al LiveView	controllers/acquisition_controller.py	20 min
+P1.4	Calcolare e inviare edge overlay data dal GrabWorker al LiveView	controllers/acquisition_controller.py	30 min
+P1.5	Aggiungere pulsante "Annulla ultima misura" (undo) nella toolbar	views/main_window.py	20 min
+P1.6	Differenziare i pulsanti sidebar Export PDF vs Export CSV	views/main_window.py + session_controller.py	15 min
+P1.7	Aggiungere timestamp ai record in quick_export()	controllers/session_controller.py	5 min
+🟢 P2 — TECH DEBT (da fare in futuro)
+#	Azione	File	Effort
+P2.1	Integrare ImageProcessor nel flusso di acquisizione	acquisition_controller.py + image_processor.py	1h
+P2.2	Integrare CalibrationController e rimuovere logica inline dalla MainWindow	main_window.py + calibration_controller.py	1h
+P2.3	Rimuovere widget standalone non usati o integrarli nella MainWindow	4 file widget	2h
+P2.4	Integrare validators.py nei dialog (login, setup, calibrazione)	3 file dialog	30 min
+P2.5	Far girare i test e fixare le fixture	conftest.py + 2 test files	1h
+P2.6	Esporre is_grabbing e connect_frame_feed() come API pubblica	acquisition_controller.py	15 min
+P2.7	Rimuovere manual_measure_tool.py (duplicato di logica nel LiveView)	1 file	5 min
+4. PROTOCOLLO DI COLLAUDO SUL CAMPO (UAT)
+Prerequisiti
+ PC con Windows 10/11, Python 3.11+, venv attivo
+ Telecamera Basler collegata (o modalità simulata)
+ Campione di calibrazione con distanza nota (es. 25mm)
+ Il software si avvia senza errori nel log
+FASE 1 — Avvio e Login (5 min)
+#	Step	Risultato Atteso	✓/✗
+1.1	Avviare python main.py	Nessun errore nel log, dialog login appare	
+1.2	Lasciare il campo operatore vuoto e premere OK	Messaggio di errore, login non accettato	
+1.3	Inserire "OPERATORE_TEST" e premere OK	MainWindow appare massimizzata, operatore visibile in sidebar e status bar	
+1.4	Verificare che il banner rosso "SISTEMA NON CALIBRATO" sia visibile	Banner rosso presente nella parte alta del centro	
+1.5	Verificare che i pulsanti "Misura Auto", "Auto-Trigger", "Misura Singola" siano disabilitati	Tutti grigi e non cliccabili	
+FASE 2 — Connessione Camera (5 min)
+#	Step	Risultato Atteso	✓/✗
+2.1	Premere "🔌 Connetti"	Status camera diventa verde "🟢 Connessa", modello visibile	
+2.2	Premere di nuovo "🔌 Connetti"	Nessun crash, messaggio "già connessa" o ignorato	
+2.3	Premere "⏏ Disconnetti"	Status torna rosso, pulsante Connetti riabilitato	
+2.4	Riconnettere la camera	Connessione riuscita nuovamente	
+FASE 3 — Video Live (10 min)
+#	Step	Risultato Atteso	✓/✗
+3.1	Premere "▶ Avvia Live"	Video appare nel LiveView, pulsante diventa "⏹ Ferma Live"	
+3.2	Muovere slider esposizione	L'immagine si schiarisce/scurisce in tempo reale	
+3.3	Muovere slider guadagno	L'immagine cambia luminosità	
+3.4	Scroll mouse sul video	Zoom in/out funziona, fattore visibile nella info bar	
+3.5	Click centrale + drag sul video	Pan funziona, l'immagine si sposta	
+3.6	Doppio click sinistro	Zoom si resetta a 1x	
+3.7	Premere "🔍 Reset Zoom"	Zoom e pan si resettano	
+3.8	Disattivare checkbox "Mostra bordi"	Overlay bordi scompare (se era visibile)	
+3.9	Disattivare checkbox "Barra di fuoco"	Barra laterale scompare	
+3.10	Disattivare checkbox "Istogramma"	Istogramma scompare	
+3.11	Lasciare il live attivo per 5 minuti	Nessun memory leak, nessun rallentamento, FPS stabile	
+FASE 4 — Calibrazione (15 min)
+#	Step	Risultato Atteso	✓/✗
+4.1	Premere "🎯 Nuova Calibrazione" (o "Calibra Ora" nel banner)	CalibrationWizard si apre	
+4.2	Premere "📸 Cattura Frame" senza camera attiva	Warning "Nessun frame disponibile"	
+4.3	Con live attivo, premere "📸 Cattura Frame"	Immagine congelata nel wizard, istruzione aggiornata	
+4.4	Cliccare il primo punto del campione	Crosshair "A" ciano appare, linea tratteggiata segue il mouse	
+4.5	Cliccare il secondo punto del campione	Crosshair "B" verde, linea gialla, distanza in px visualizzata	
+4.6	Inserire la distanza reale (es. 25.000 mm)	Scala mm/px calcolata e mostrata in verde	
+4.7	Premere "🔄 Ripeti Selezione"	Punti cancellati, si può ricliccare	
+4.8	Premere "✓ Salva Calibrazione"	Dialog conferma, calibrazione salvata, wizard si chiude	
+4.9	Verificare che il banner rosso è scomparso	Banner non più visibile	
+4.10	Verificare sidebar: "🟢 Calibrato", scala e data visibili	Dati corretti	
+4.11	Verificare che "Misura Auto" e "Misura Singola" sono ora abilitati	Pulsanti attivi (se live è attivo)	
+4.12	Chiudere e riaprire l'applicazione	Calibrazione viene ricaricata dal file YAML	
+FASE 5 — Misura Singola (10 min)
+#	Step	Risultato Atteso	✓/✗
+5.1	Con live attivo e calibrato, premere "📸 Misura Singola"	Flash bianco, misura appare nella tabella	
+5.2	Verificare il valore nella tabella	Width in mm > 0, timestamp presente, status OK	
+5.3	Verificare il pannello statistiche	Media, min, max, σ aggiornati	
+5.4	Ripetere 5 misure singole	Tabella ha 5 righe, statistiche aggiornate progressivamente	
+5.5	Spostare il campione fuori campo e misurare	Status "ERROR" o "NOK", valore anomalo	
+FASE 6 — Misura Manuale con Zoom (10 min)
+#	Step	Risultato Atteso	✓/✗
+6.1	Attivare "📐 Misura Manuale" nella toolbar	Cursore diventa crosshair	
+6.2	Cliccare punto A e punto B su un bordo noto	Linea gialla con distanza in px (o mm se calibrato)	
+6.3	Zoomare 2x con la rotella	Video si ingrandisce	
+6.4	Fare una nuova misura manuale mentre zoomato	La linea e i punti sono allineati con l'immagine, non spostati	
+6.5	Pannare l'immagine e misurare di nuovo	Misura ancora allineata	
+6.6	Premere "🗑 Cancella Manuali"	Tutte le linee manuali scompaiono	
+6.7	Click destro durante misura manuale	Primo punto cancellato, si ricomincia	
+FASE 7 — Sessione di Prova con Tolleranze (15 min)
+#	Step	Risultato Atteso	✓/✗
+7.1	Premere "📋 Nuova Sessione"	Dialog "Nuova Prova" appare con layout pulito	
+7.2	Lasciare nome vuoto e premere "Avvia Prova"	Warning "Nome Mancante"	
+7.3	Inserire nome "Test Collaudo 01"	Campo accettato	
+7.4	Abilitare tolleranze: Nom=5.000, USL=5.100, LSL=4.900	Spinbox si abilitano, valori corretti	
+7.5	Impostare USL < LSL e premere Avvia	Warning "USL deve essere maggiore di LSL"	
+7.6	Correggere e premere "▶ Avvia Prova"	Dialog si chiude, sidebar mostra nome sessione in verde	
+7.7	Eseguire 10 misure singole o auto	Tabella si popola, statistiche si aggiornano	
+7.8	Verificare che le misure NOK (fuori tolleranza) siano evidenziate	Status "NOK" in rosso nella tabella	
+7.9	Premere "⏹ Termina Sessione"	Dialog riepilogo con media, OK%, offre export	
+7.10	Premere "Sì" per esportare	Dialog export si apre	
+FASE 8 — Export (10 min)
+#	Step	Risultato Atteso	✓/✗
+8.1	Nel dialog export, selezionare CSV	Radio button CSV selezionato	
+8.2	Premere "✓ Esporta"	File CSV creato, messaggio di conferma	
+8.3	Aprire il CSV in Excel	Colonne corrette, decimali con virgola, statistiche in fondo	
+8.4	Ripetere con PDF (se reportlab installato)	File PDF creato	
+8.5	Aprire il PDF	Intestazione con operatore e data, tabella misure, statistiche, footer crediti	
+8.6	Verificare che il nome della prova appaia nel report	Titolo o sottotitolo contiene "Test Collaudo 01"	
+FASE 9 — Stress Test (15 min)
+#	Step	Risultato Atteso	✓/✗
+9.1	Attivare Misura Auto + Auto-Trigger	Entrambi i toggle attivi	
+9.2	Lasciare acquisire automaticamente per 5 minuti	Misure si accumulano senza crash, FPS stabile	
+9.3	Con 100+ misure, verificare fluidità scroll tabella	Scroll fluido, nessun lag	
+9.4	Con 100+ misure, verificare pannello statistiche	Tutti i valori aggiornati, Cp/Cpk calcolati (se tolleranze attive)	
+9.5	Disconnettere la camera durante acquisizione	Acquisizione si ferma, nessun crash, status aggiornato	
+9.6	Riconnettere e riprendere	Camera si riconnette, live riavviabile	
+FASE 10 — Chiusura e Persistenza (5 min)
+#	Step	Risultato Atteso	✓/✗
+10.1	Con sessione attiva, premere ✕ per chiudere	Dialog conferma con warning "sessione attiva"	
+10.2	Premere "No"	Applicazione resta aperta	
+10.3	Premere "Sì"	Log: sessione salvata automaticamente, applicazione si chiude	
+10.4	Verificare data/sessions/	File JSON session_*_autosave.json presente	
+10.5	Verificare data/calibration/	File YAML calibrazione presente	
+10.6	Riaprire l'applicazione	Calibrazione ricaricata, operatori storico disponibile nel login	
+VERDETTO FINALE
+Area	Stato	Note
+Architettura	🟡 Solida ma con widget orfani	4 widget standalone + 2 controller non integrati
+Threading	🟡 Funziona grazie al GIL ma non è formalmente safe	Lock mancante in MetrologyEngine
+Flusso Dati	🟡 Catena principale OK, dettagli mancanti	Istogramma, sharpness, edge overlay non collegati
+UI/UX	🟢 Professionale e coerente	Fix TestSetupDialog completato
+Export	🟡 Funzionale ma con lacune minori	Nome prova non nel titolo PDF, timestamp mancanti in quick_export
+Stabilità	🟡 Stabile in uso normale	Rischio crash su firma errata Signal/Slot (P0.1-P0.3)
+Raccomandazione: Risolvere i 7 item P0 prima di qualsiasi utilizzo in laboratorio. Richiedono circa 1 ora di lavoro totale e prevengono crash in produzione.
