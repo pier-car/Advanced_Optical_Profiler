@@ -156,7 +156,7 @@ class CalibrationController(QObject):
         """
         from views.widgets.calibration_wizard import CalibrationWizard
 
-        frame = self._live_view._current_frame
+        frame = self._live_view.get_current_frame()
 
         wizard = CalibrationWizard(
             calibration_engine=self._cal_engine,

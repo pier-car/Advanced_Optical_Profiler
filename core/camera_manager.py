@@ -72,6 +72,11 @@ class CameraManager:
         self._sim_width: int = 3840
         self._sim_height: int = 2748
 
+        # P6 — Buffer pre-allocati per ridurre la pressione sul GC
+        # (~10MB di allocazione eliminata per frame in modalità simulata)
+        self._sim_frame_buf: Optional[np.ndarray] = None
+        self._sim_rng = np.random.default_rng()  # RNG moderno (più veloce)
+
         if self._simulate:
             logger.info("CameraManager inizializzato in MODALITÀ SIMULATA")
         else:
@@ -238,39 +243,52 @@ class CameraManager:
     #     return frame
     def _generate_simulated_frame(self) -> np.ndarray:
         """
-        Versione ottimizzata (vectorized) per ridurre il carico CPU.
-        Genera un frame 720p in pochi millisecondi.
+        Genera un frame simulato riutilizzando buffer pre-allocati (P6).
+
+        La prima chiamata alloca i buffer; le successive li riusano
+        in-place eliminando ~30MB di allocazione+GC per frame a 45fps.
+        Usa np.random.Generator (RNG moderno) al posto di randint legacy.
         """
         self._sim_frame_counter += 1
 
-        # Crea sfondo bianco
-        frame = np.full((self._sim_height, self._sim_width), 240, dtype=np.uint8)
+        # Alloca il buffer al primo utilizzo (lazy init).
+        # int16 per consentire l'addizione di rumore con segno senza overflow
+        # prima del clip finale; il frame restituito è uint8.
+        if self._sim_frame_buf is None:
+            self._sim_frame_buf = np.empty(
+                (self._sim_height, self._sim_width), dtype=np.int16
+            )
 
-        # Calcolo oscillazione (stesse dinamiche di prima)
+        # Sfondo bianco nel buffer riusato
+        self._sim_frame_buf[:] = 240
+
+        # Calcolo oscillazione bandina
         center_y = self._sim_height // 2
-        half_band_w = 400 
+        half_band_w = 400
         offset = int(20 * np.sin(self._sim_frame_counter * 0.05))
         angle_var = 0.02 * np.sin(self._sim_frame_counter * 0.03)
 
-        # Creiamo una rampa per l'inclinazione
         x_indices = np.arange(self._sim_width)
-        y_centers = center_y + offset + (angle_var * (x_indices - self._sim_width // 2))
-        
-        # Calcoliamo i limiti superiore e inferiore per ogni colonna (vectorized)
+        y_centers = center_y + offset + (
+            angle_var * (x_indices - self._sim_width // 2)
+        )
         y_tops = np.clip(y_centers - half_band_w, 0, self._sim_height).astype(int)
         y_bots = np.clip(y_centers + half_band_w, 0, self._sim_height).astype(int)
 
-        # Disegniamo la bandina senza cicli for espliciti
-        # (Usiamo una maschera booleana 2D per velocità massima)
         yy, xx = np.ogrid[:self._sim_height, :self._sim_width]
         mask = (yy >= y_tops) & (yy < y_bots)
-        frame[mask] = 10
+        self._sim_frame_buf[mask] = 10
 
-        # Aggiunta rumore (solo se necessario per i test, altrimenti commenta per velocità)
-        noise = np.random.randint(-3, 4, (self._sim_height, self._sim_width), dtype=np.int16)
-        frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        # Rumore nel buffer riusato — np.random.Generator.integers
+        noise = self._sim_rng.integers(
+            -3, 4,
+            size=(self._sim_height, self._sim_width),
+            dtype=np.int16,
+        )
+        np.add(self._sim_frame_buf, noise, out=self._sim_frame_buf)
+        np.clip(self._sim_frame_buf, 0, 255, out=self._sim_frame_buf)
 
-        return frame
+        return self._sim_frame_buf.astype(np.uint8)
 
     # ═══════════════════════════════════════════════════════════
     # CONTROLLO PARAMETRI

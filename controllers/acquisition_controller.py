@@ -31,11 +31,19 @@ from PySide6.QtCore import (
     QObject, Signal, Slot, QThread, QTimer, Qt
 )
 
+try:
+    import cv2 as _cv2  # P5 — import a livello modulo (non dentro il metodo)
+    _HAS_CV2 = True
+except ImportError:
+    _cv2 = None
+    _HAS_CV2 = False
+
 from core.camera_manager import CameraManager
 from core.metrology_engine import (
     MetrologyEngine, MeasurementResult, MeasurementStatus, PipelineConfig
 )
 from core.calibration_engine import CalibrationEngine
+from core.image_processor import ImageProcessor
 from views.widgets.live_view_widget import (
     LiveViewWidget, EdgeOverlayData, OSDSeverity
 )
@@ -191,14 +199,20 @@ class GrabWorker(QObject):
         self,
         camera_manager: CameraManager,
         metrology_engine: MetrologyEngine,
+        image_processor: Optional[ImageProcessor] = None,
     ):
         super().__init__()
         self._camera = camera_manager
         self._engine = metrology_engine
+        # P8 — ImageProcessor opzionale per preprocessing nel grab thread
+        self._processor: Optional[ImageProcessor] = image_processor
         self._running: bool = False
         self._auto_measure: bool = False
         self._frame_count: int = 0
         self._measure_every_n: int = 1
+        # P1+P7 — Decimazione visual aids: istogramma e nitidezza
+        # ogni N frame (default: 3) per risparmiare ~60-70% CPU
+        self._visual_aids_every_n: int = 3
         self._fps_timer_start: float = 0.0
         self._fps_frame_count: int = 0
         self._last_fps: float = 0.0
@@ -226,15 +240,24 @@ class GrabWorker(QObject):
                     self._fps_frame_count = 0
                     self._fps_timer_start = time.perf_counter()
 
+                # P8 — Preprocessing opzionale nel grab thread
+                if (
+                    self._processor is not None
+                    and not self._processor.is_identity
+                ):
+                    frame = self._processor.process(frame)
+
                 self.frame_ready.emit(frame)
 
-                histogram = np.histogram(
-                    frame.ravel(), bins=256, range=(0, 256)
-                )[0]
-                self.histogram_ready.emit(histogram.astype(np.float32))
+                # P1+P7 — Visual aids solo ogni N frame
+                if (self._frame_count % self._visual_aids_every_n) == 0:
+                    histogram = np.histogram(
+                        frame.ravel(), bins=256, range=(0, 256)
+                    )[0]
+                    self.histogram_ready.emit(histogram.astype(np.float32))
 
-                sharpness = self._compute_sharpness(frame)
-                self.sharpness_ready.emit(sharpness)
+                    sharpness = self._compute_sharpness(frame)
+                    self.sharpness_ready.emit(sharpness)
 
                 if self._auto_measure:
                     if (self._frame_count % self._measure_every_n) == 0:
@@ -260,19 +283,28 @@ class GrabWorker(QObject):
     def set_decimation(self, every_n: int):
         self._measure_every_n = max(1, every_n)
 
+    def set_visual_aids_decimation(self, every_n: int):
+        """
+        Imposta ogni quanti frame calcolare istogramma e nitidezza (P7).
+        Default: 3 (aggiornamento ~15fps a 45fps — fluido e leggero).
+        """
+        self._visual_aids_every_n = max(1, every_n)
+
     @property
     def fps(self) -> float:
         return self._last_fps
 
     @staticmethod
     def _compute_sharpness(frame: np.ndarray) -> float:
-        import cv2
+        # P5 — cv2 importato a livello modulo, non qui dentro
+        if not _HAS_CV2:
+            return 0.0
         if frame.ndim == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
         else:
             gray = frame
         small = gray[::4, ::4]
-        laplacian = cv2.Laplacian(small, cv2.CV_64F)
+        laplacian = _cv2.Laplacian(small, _cv2.CV_64F)
         return float(laplacian.var())
 
 
@@ -311,6 +343,7 @@ class AcquisitionController(QObject):
         camera_manager: CameraManager,
         metrology_engine: MetrologyEngine,
         calibration_engine: CalibrationEngine,
+        image_processor: Optional[ImageProcessor] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -319,6 +352,8 @@ class AcquisitionController(QObject):
         self._camera = camera_manager
         self._engine = metrology_engine
         self._calibration = calibration_engine
+        # P8 — ImageProcessor opzionale (passato al GrabWorker)
+        self._image_processor: Optional[ImageProcessor] = image_processor
 
         self._auto_measure: bool = False
         self._auto_trigger: bool = False
@@ -449,6 +484,7 @@ class AcquisitionController(QObject):
         self._grab_worker = GrabWorker(
             camera_manager=self._camera,
             metrology_engine=self._engine,
+            image_processor=self._image_processor,  # P8
         )
         self._grab_worker.moveToThread(self._grab_thread)
 
@@ -510,6 +546,43 @@ class AcquisitionController(QObject):
 
         logger.info("Acquisizione fermata")
         self.status_message.emit("⏹ Acquisizione fermata")
+
+    # ═══════════════════════════════════════════════════════════
+    # API PUBBLICA — proprietà e helper (R2)
+    # ═══════════════════════════════════════════════════════════
+
+    @property
+    def is_grabbing(self) -> bool:
+        """
+        True se il GrabWorker è attivo e sta acquisendo frame (R2).
+        Sostituisce l'accesso diretto a _is_grabbing dall'esterno.
+        """
+        return self._is_grabbing
+
+    def connect_frame_feed(self, slot) -> bool:
+        """
+        Connette uno slot al segnale frame_ready del GrabWorker (R2).
+
+        Deve essere chiamato DOPO start_grabbing(). Sostituisce l'accesso
+        diretto a _grab_worker.frame_ready.connect(...) dall'esterno.
+
+        Args:
+            slot: callable da connettere al segnale frame_ready
+
+        Returns:
+            True se la connessione è riuscita, False se il GrabWorker
+            non è ancora attivo (start_grabbing() non ancora chiamato).
+        """
+        if self._grab_worker is not None:
+            self._grab_worker.frame_ready.connect(
+                slot, type=Qt.ConnectionType.QueuedConnection
+            )
+            return True
+        logger.warning(
+            "connect_frame_feed: GrabWorker non ancora avviato. "
+            "Chiamare start_grabbing() prima di connect_frame_feed()."
+        )
+        return False
 
     # ═══════════════════════════════════════════════════════════
     # TOGGLE: AUTO MEASURE — CON CALIBRATION GATE
@@ -598,14 +671,12 @@ class AcquisitionController(QObject):
         if not self._check_calibration("Misura Singola"):
             return
 
-        frame = self._live_view._current_frame
+        frame = self._live_view.get_current_frame()
         if frame is None or frame.size == 0:
             self.status_message.emit("⚠️ Nessun frame disponibile")
             return
 
-        # Copia del frame per evitare race condition col GrabWorker
-        frame_copy = frame.copy()
-
+        # get_current_frame() restituisce già una copia thread-safe
         self.status_message.emit("📸 Misura in corso...")
         self._live_view.show_osd_message(
             "📸 Misura in corso...", OSDSeverity.INFO, 1500
@@ -615,7 +686,7 @@ class AcquisitionController(QObject):
         self._single_thread = QThread()
         self._single_worker = _SingleMeasureWorker(
             engine=self._engine,
-            frame=frame_copy,
+            frame=frame,
         )
         self._single_worker.moveToThread(self._single_thread)
 

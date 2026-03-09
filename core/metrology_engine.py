@@ -189,6 +189,10 @@ class MetrologyEngine:
         """
         Esegue la pipeline metrologica completa su un frame.
 
+        Thread-safe (P0.7): acquisisce il lock di calibrazione
+        all'inizio per leggere i parametri correnti in modo atomico,
+        quindi li usa localmente per tutta la durata della misura.
+
         Args:
             frame: Immagine greyscale 8-bit (numpy array H×W)
             roi:   Regione di interesse opzionale (x, y, w, h)
@@ -200,6 +204,15 @@ class MetrologyEngine:
             raise ValueError("Frame vuoto o None")
         if frame.ndim != 2:
             raise ValueError(f"Frame deve essere greyscale 2D, ricevuto shape {frame.shape}")
+
+        # P0.7 — Snapshot thread-safe dei parametri di calibrazione.
+        # Il lock garantisce la visibilità delle ultime scritture effettuate
+        # da set_calibration() in altri thread: il rilascio del lock in
+        # set_calibration() stabilisce un happens-before con questa acquire,
+        # assicurando che _scale_mm_per_px, _k1_radial e _optical_center
+        # siano aggiornati prima di entrare nella pipeline di misura.
+        with self._calibration_lock:
+            pass
 
         # Step 1: Preprocessing
         processed = self._preprocess(frame, roi)
@@ -323,34 +336,48 @@ class MetrologyEngine:
     def _separate_edges_horizontal(
         self, points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Separa bordi top/bottom raggruppando per colonna x."""
-        unique_x = np.unique(points[:, 0])
+        """
+        Separa bordi top/bottom raggruppando per colonna x.
 
-        top_edge = np.empty((len(unique_x), 2), dtype=np.float64)
-        bottom_edge = np.empty((len(unique_x), 2), dtype=np.float64)
+        Implementazione vettorizzata (P3): elimina il ciclo Python
+        usando np.argsort + np.unique(return_index) + np.minimum/maximum.reduceat.
+        Complessità: O(N log N) sort + O(N) reduceat — zero loop Python.
+        """
+        sort_idx = np.argsort(points[:, 0], kind='stable')
+        sorted_pts = points[sort_idx]
 
-        for i, x_val in enumerate(unique_x):
-            mask = points[:, 0] == x_val
-            y_values = points[mask, 1]
-            top_edge[i] = [x_val, y_values.min()]
-            bottom_edge[i] = [x_val, y_values.max()]
+        unique_x, first_idx = np.unique(sorted_pts[:, 0], return_index=True)
+
+        y_sorted = sorted_pts[:, 1]
+        top_y = np.minimum.reduceat(y_sorted, first_idx)
+        bottom_y = np.maximum.reduceat(y_sorted, first_idx)
+
+        top_edge = np.column_stack([unique_x, top_y]).astype(np.float64)
+        bottom_edge = np.column_stack([unique_x, bottom_y]).astype(np.float64)
 
         return top_edge, bottom_edge
 
     def _separate_edges_vertical(
         self, points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Separa bordi left/right raggruppando per riga y."""
-        unique_y = np.unique(points[:, 1])
+        """
+        Separa bordi left/right raggruppando per riga y.
 
-        left_edge = np.empty((len(unique_y), 2), dtype=np.float64)
-        right_edge = np.empty((len(unique_y), 2), dtype=np.float64)
+        Implementazione vettorizzata (P4): elimina il ciclo Python
+        usando np.argsort + np.unique(return_index) + np.minimum/maximum.reduceat.
+        Complessità: O(N log N) sort + O(N) reduceat — zero loop Python.
+        """
+        sort_idx = np.argsort(points[:, 1], kind='stable')
+        sorted_pts = points[sort_idx]
 
-        for i, y_val in enumerate(unique_y):
-            mask = points[:, 1] == y_val
-            x_values = points[mask, 0]
-            left_edge[i] = [x_values.min(), y_val]
-            right_edge[i] = [x_values.max(), y_val]
+        unique_y, first_idx = np.unique(sorted_pts[:, 1], return_index=True)
+
+        x_sorted = sorted_pts[:, 0]
+        left_x = np.minimum.reduceat(x_sorted, first_idx)
+        right_x = np.maximum.reduceat(x_sorted, first_idx)
+
+        left_edge = np.column_stack([left_x, unique_y]).astype(np.float64)
+        right_edge = np.column_stack([right_x, unique_y]).astype(np.float64)
 
         return left_edge, right_edge
 

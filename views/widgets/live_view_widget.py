@@ -247,6 +247,22 @@ class LiveViewWidget(QWidget):
         self._show_edges = show
         self.update()
 
+    def get_current_frame(self) -> Optional[np.ndarray]:
+        """
+        Restituisce una copia thread-safe del frame corrente.
+
+        Usare al posto dell'accesso diretto a _current_frame.
+        Garantisce un'istantanea isolata: il GrabWorker può sovrascrivere
+        _current_frame senza invalidare il frame già estratto (R1).
+
+        Returns:
+            Copia del frame corrente, o None se nessun frame disponibile.
+        """
+        frame = self._current_frame
+        if frame is not None:
+            return frame.copy()
+        return None
+
     def set_show_focus_bar(self, show):
         self._show_focus_bar = show
         self.update()
