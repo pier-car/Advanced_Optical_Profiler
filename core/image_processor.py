@@ -142,9 +142,32 @@ class ImageProcessor:
         else:
             self._clahe = None
 
+    @property
+    def is_identity(self) -> bool:
+        """
+        Restituisce True se la pipeline non applica alcuna trasformazione
+        (nessuno step abilitato). Usato dal GrabWorker per ottimizzare
+        il fast-path: se is_identity è True, process() viene saltato (P2).
+        """
+        cfg = self._config
+        return not (
+            cfg.roi_enabled
+            or cfg.convert_grayscale
+            or cfg.clahe_enabled
+            or cfg.gaussian_enabled
+            or cfg.median_enabled
+            or cfg.brightness_contrast_enabled
+            or cfg.sharpen_enabled
+        )
+
     def process(self, frame: np.ndarray) -> np.ndarray:
         """
         Esegue la pipeline di pre-processing.
+
+        Ottimizzazione P2 (zero-copy fast path): il frame viene copiato
+        solo prima della prima operazione distruttiva (in-place). Se
+        nessuno step è abilitato, il frame originale viene restituito
+        direttamente senza allocazioni.
 
         Args:
             frame: Frame originale (grayscale o colore)
@@ -158,37 +181,49 @@ class ImageProcessor:
         if not HAS_CV2:
             return frame
 
-        result = frame.copy()
         cfg = self._config
+        result = frame  # riferimento, nessuna copia ancora
+        needs_copy = True  # True = prossima op deve copiare prima
 
-        # 1. ROI
+        # 1. ROI — restituisce una view (slice), non una copia.
+        # Conservativamente impostiamo needs_copy=True: la prossima
+        # operazione distruttiva dovrà copiare il buffer prima di modificarlo.
         if cfg.roi_enabled:
             result = self._apply_roi(result)
+            needs_copy = True
 
-        # 2. Grayscale
+        # 2. Grayscale — crea un nuovo array: la copia è implicita
         if cfg.convert_grayscale and result.ndim == 3:
             result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+            needs_copy = False
 
-        # 3. CLAHE
+        # 3. CLAHE — opera su un nuovo array
         if cfg.clahe_enabled and self._clahe is not None:
+            if needs_copy:
+                result = result.copy()
+                needs_copy = False
             result = self._apply_clahe(result)
 
-        # 4. Gaussian blur
+        # 4. Gaussian blur — produce nuovo array
         if cfg.gaussian_enabled:
             ks = cfg.gaussian_kernel_size
             result = cv2.GaussianBlur(result, (ks, ks), 0)
+            needs_copy = False
 
-        # 5. Filtro mediano
+        # 5. Filtro mediano — produce nuovo array
         if cfg.median_enabled:
             result = cv2.medianBlur(result, cfg.median_kernel_size)
+            needs_copy = False
 
-        # 6. Brightness/Contrast
+        # 6. Brightness/Contrast — produce nuovo array via astype/clip
         if cfg.brightness_contrast_enabled:
             result = self._apply_brightness_contrast(result)
+            needs_copy = False
 
-        # 7. Sharpening
+        # 7. Sharpening — produce nuovo array
         if cfg.sharpen_enabled:
             result = self._apply_sharpen(result)
+            needs_copy = False
 
         return result
 

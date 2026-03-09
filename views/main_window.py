@@ -840,13 +840,13 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_calibrate(self):
         from views.widgets.calibration_wizard import CalibrationWizard
-        frame = self._live_view._current_frame
+        frame = self._live_view.get_current_frame()
         wizard = CalibrationWizard(
             calibration_engine=self._calibration_engine,
             current_frame=frame,
             parent=self,
         )
-        if (self._acquisition_controller._is_grabbing
+        if (self._acquisition_controller.is_grabbing
                 and self._acquisition_controller._grab_worker is not None):
             self._acquisition_controller._grab_worker.frame_ready.connect(
                 wizard.set_current_frame
