@@ -234,10 +234,15 @@ class MetrologyEngine:
         scanlines = self._measure_scanlines(processed, top_line, bottom_line, theta_avg)
 
         # Step 8: Aggregazione risultati
+        # All'interno di measure(), verso la fine:
         result = self._aggregate_results(
-            top_line, bottom_line, theta_avg, scanlines, processed
+            top_line, 
+            bottom_line, 
+            theta_avg, 
+            scanlines, 
+            processed,
+            cached_binary=binary  
         )
-
         return result
 
     # ─── STEP 1: PREPROCESSING ────────────────────────────────
@@ -815,3 +820,4 @@ class MetrologyEngine:
         hist = hist.flatten() / hist.sum()
 
         return hist
+
