@@ -48,6 +48,8 @@ from views.widgets.live_view_widget import (
     LiveViewWidget, EdgeOverlayData, OSDSeverity
 )
 
+from config import ROI_ENABLED, ROI_WIDTH, ROI_HEIGHT
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +219,8 @@ class GrabWorker(QObject):
         self._fps_frame_count: int = 0
         self._last_fps: float = 0.0
 
+        self._cached_roi = None  # Cache per il ROI calcolato dinamicamente
+
     @Slot()
     def run(self):
         self._running = True
@@ -259,11 +263,33 @@ class GrabWorker(QObject):
                     sharpness = self._compute_sharpness(frame)
                     self.sharpness_ready.emit(sharpness)
 
+                # if self._auto_measure:
+                #     if (self._frame_count % self._measure_every_n) == 0:
+                #         try:
+                #             result = self._engine.measure(frame)
+                #             self.measurement_completed.emit(result)
+                #         except (ValueError, RuntimeError) as e:
+                #             logger.debug(f"GrabWorker: misura fallita: {e}")
                 if self._auto_measure:
                     if (self._frame_count % self._measure_every_n) == 0:
                         try:
-                            result = self._engine.measure(frame)
+                            # --- INIZIO CALCOLO DINAMICO ROI ---
+                            # Lo calcoliamo solo sul primo frame, poi usiamo la memoria
+                            if ROI_ENABLED and self._cached_roi is None:
+                                frame_h, frame_w = frame.shape[:2]
+                                # Calcola il centro, evitando coordinate negative
+                                roi_x = max(0, (frame_w - ROI_WIDTH) // 2)
+                                roi_y = max(0, (frame_h - ROI_HEIGHT) // 2)
+                                self._cached_roi = (roi_x, roi_y, ROI_WIDTH, ROI_HEIGHT)
+                            
+                            # Decidiamo se passare il ROI in base al file di configurazione
+                            current_roi = self._cached_roi if ROI_ENABLED else None
+                            # --- FINE CALCOLO DINAMICO ROI ---
+                            
+                            # Eseguiamo la misura passando il ROI
+                            result = self._engine.measure(frame, roi=current_roi)
                             self.measurement_completed.emit(result)
+                            
                         except (ValueError, RuntimeError) as e:
                             logger.debug(f"GrabWorker: misura fallita: {e}")
 
@@ -857,4 +883,5 @@ class AcquisitionController(QObject):
                 self._camera.disconnect()
         except Exception as e:
             logger.warning(f"Cleanup camera: {e}")
+
         logger.info("AcquisitionController: cleanup completato")
