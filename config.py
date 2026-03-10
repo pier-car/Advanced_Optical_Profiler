@@ -67,6 +67,17 @@ METROLOGY_RANSAC_ITERATIONS = 100
 METROLOGY_RANSAC_THRESHOLD = 3.0
 METROLOGY_MIN_INLIERS_RATIO = 0.6
 
+# Impostazioni ROI (Region of Interest)
+ROI_ENABLED   = True
+ROI_CENTER_X  = 1920   # centro orizzontale (3840 / 2)
+ROI_CENTER_Y  = 1374   # centro verticale   (2748 / 2)
+ROI_WIDTH     = 600    # larghezza ROI in pixel
+ROI_HEIGHT    = 1000   # altezza ROI (deve contenere la bandina + margini)
+
+# Derivato — non modificare:
+ROI_X = ROI_CENTER_X - ROI_WIDTH  // 2   # = 1620
+ROI_Y = ROI_CENTER_Y - ROI_HEIGHT // 2   # =  874
+
 # ═══════════════════════════════════════════════════════════════
 # CALIBRAZIONE
 # ═══════════════════════════════════════════════════════════════
@@ -125,4 +136,5 @@ UI_FONT_MONO = "Consolas"
 
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
