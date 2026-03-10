@@ -672,6 +672,7 @@ class MetrologyEngine:
         theta_avg: float,
         scanlines: list[ScanlineResult],
         image: np.ndarray,
+        cached_binary=None,
     ) -> MeasurementResult:
         """Aggrega i risultati delle scanline e valuta la qualità."""
         cfg = self.config
@@ -711,9 +712,12 @@ class MetrologyEngine:
         # Invece di usare percentili globali (che falliscono quando la
         # bandina occupa >50% dell'immagine), usiamo la segmentazione
         # già calcolata per separare i pixel di sfondo e oggetto.
-        binary = self._segment(image)
-        fg_pixels = image[binary > 0]  # Pixel della bandina
-        bg_pixels = image[binary == 0]  # Pixel dello sfondo
+    
+        # Usa la maschera passata da measure(), ricalcolando solo se strettamente necessario
+        binary = cached_binary if cached_binary is not None else self._segment(image)
+        
+        fg_pixels = image[binary > 0]
+        bg_pixels = image[binary == 0]
 
         if len(fg_pixels) > 0 and len(bg_pixels) > 0:
             bg_mean = float(np.mean(bg_pixels))
@@ -809,4 +813,5 @@ class MetrologyEngine:
         """Calcola istogramma 256-bin normalizzato."""
         hist = cv2.calcHist([frame], [0], None, [256], [0, 256])
         hist = hist.flatten() / hist.sum()
+
         return hist
