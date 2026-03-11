@@ -932,12 +932,14 @@ class MainWindow(QMainWindow):
             element = self._combo_usaf_element.currentData()
             self._calibration_controller.set_usaf_group_element(group, element)
             self._calibration_controller.start_usaf_click_calibration()
-            # Passa la camera simulata alla modalità USAF target
-            self._camera_manager.set_simulation_mode("usaf_target")
+            # Passa la camera simulata alla modalità USAF target solo se in simulazione
+            if self._camera_manager.is_simulated:
+                self._camera_manager.set_simulation_mode("usaf_target")
         else:
             self._calibration_controller.stop_usaf_click_calibration()
-            # Ripristina la camera simulata alla modalità bandina
-            self._camera_manager.set_simulation_mode("bandina")
+            # Ripristina la camera simulata alla modalità bandina solo se in simulazione
+            if self._camera_manager.is_simulated:
+                self._camera_manager.set_simulation_mode("bandina")
 
     @Slot()
     def _on_usaf_selection_changed(self):
@@ -993,8 +995,9 @@ class MainWindow(QMainWindow):
         if self._acquisition_controller._is_grabbing:
             self._act_auto_measure.setEnabled(True)
             self._act_single_measure.setEnabled(True)
-        # Ripristina la camera simulata alla modalità bandina
-        self._camera_manager.set_simulation_mode("bandina")
+        # Ripristina la camera simulata alla modalità bandina solo se in simulazione
+        if self._camera_manager.is_simulated:
+            self._camera_manager.set_simulation_mode("bandina")
 
     def _update_calibration_ui(self):
         cal = self._calibration_engine
