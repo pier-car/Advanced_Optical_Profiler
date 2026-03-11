@@ -123,6 +123,15 @@ class MainWindow(QMainWindow):
             parent=self,
         )
 
+        from controllers.calibration_controller import CalibrationController
+        self._calibration_controller = CalibrationController(
+            calibration_engine=self._calibration_engine,
+            metrology_engine=self._metrology_engine,
+            live_view=self._live_view,
+            operator_id=self._operator_id,
+            parent=self,
+        )
+
         # P0.5 — Propagare calibrazione pre-esistente
         if self._calibration_engine.is_calibrated:
             self._session_controller.set_calibration_scale(
@@ -221,6 +230,13 @@ class MainWindow(QMainWindow):
         self._btn_calibrate = QPushButton("🎯  Nuova Calibrazione")
         self._btn_calibrate.setMinimumHeight(32)
         call.addWidget(self._btn_calibrate)
+        self._btn_usaf_calib = QPushButton("📐 Calibrazione USAF (Click)")
+        self._btn_usaf_calib.setCheckable(True)
+        self._btn_usaf_calib.setMinimumHeight(32)
+        self._btn_usaf_calib.setToolTip(
+            "Calibrazione rapida: clicca su un gap del target USAF 1951"
+        )
+        call.addWidget(self._btn_usaf_calib)
         ll.addWidget(calg)
 
         # ── Prova di Misura ──
@@ -596,6 +612,18 @@ class MainWindow(QMainWindow):
             self._on_calibration_required
         )
 
+        # ── USAF Click-to-Calibrate ──
+        self._btn_usaf_calib.toggled.connect(self._on_usaf_calib_toggled)
+        self._calibration_controller.calibration_applied.connect(
+            self._on_calibration_done
+        )
+        self._calibration_controller.calibration_applied.connect(
+            lambda _: self._btn_usaf_calib.setChecked(False)
+        )
+        self._calibration_controller.status_message.connect(
+            self._status_bar_widget.show_message
+        )
+
         # ── AcquisitionController → flusso dati misura ──
         self._acquisition_controller.measure_captured.connect(
             self._measurement_controller.on_measure_captured
@@ -847,6 +875,14 @@ class MainWindow(QMainWindow):
         self._act_auto_trigger.setChecked(False)
         self._act_auto_trigger.blockSignals(False)
 
+    @Slot(bool)
+    def _on_usaf_calib_toggled(self, checked: bool):
+        """Attiva/disattiva la modalità Click-to-Calibrate USAF."""
+        if checked:
+            self._calibration_controller.start_usaf_click_calibration()
+        else:
+            self._calibration_controller.stop_usaf_click_calibration()
+
     @Slot()
     def _on_calibrate(self):
         from views.widgets.calibration_wizard import CalibrationWizard
@@ -1080,6 +1116,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             logger.info("Chiusura applicazione")
+            self._calibration_controller.cleanup()
             self._session_controller.cleanup()
             self._measurement_controller.cleanup()
             self._acquisition_controller.cleanup()

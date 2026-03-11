@@ -99,6 +99,7 @@ class ManualMeasureResult:
 class LiveViewWidget(QWidget):
     manual_measure_completed = Signal(float, float)
     frame_clicked = Signal(float, float)
+    calibration_point_clicked = Signal(int, int)   # (sensor_x, sensor_y)
 
     FOCUS_BAR_LEFT_MARGIN = 50
     FOCUS_BAR_WIDTH = 22
@@ -143,6 +144,9 @@ class LiveViewWidget(QWidget):
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(16)
         self._flash_timer.timeout.connect(self._animate_flash)
+        # ── Stato calibrazione USAF Click-to-Calibrate ──
+        self._usaf_calib_mode: bool = False
+        self._usaf_calib_result: Optional[dict] = None
         self.setMinimumSize(640, 480)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -275,6 +279,28 @@ class LiveViewWidget(QWidget):
         """Imposta il fattore di scala per le misure manuali."""
         self._calibration_scale = scale_mm_per_px
 
+    @Slot(bool)
+    def set_usaf_calibration_mode(self, active: bool):
+        """Attiva/disattiva la modalità Click-to-Calibrate USAF."""
+        self._usaf_calib_mode = active
+        if active:
+            self._usaf_calib_result = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.show_osd_message(
+                "🎯 MODALITÀ CALIBRAZIONE — Cliccare al centro di uno spazio tra le barre",
+                OSDSeverity.INFO, 5000
+            )
+        else:
+            if not self._manual_mode:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    @Slot(dict)
+    def set_usaf_calibration_result(self, result: dict):
+        """Riceve il risultato della calibrazione USAF dal controller."""
+        self._usaf_calib_result = result
+        self.update()
+
     def reset_zoom(self):
         self._zoom_factor = 1.0
         self._pan_offset = QPointF(0.0, 0.0)
@@ -368,6 +394,7 @@ class LiveViewWidget(QWidget):
                 self._paint_edge_overlay(painter)
 
             self._paint_manual_measurements(painter)
+            self._paint_usaf_calibration_overlay(painter)   # ← USAF overlay
 
             if self._manual_mode:
                 self._paint_manual_in_progress(painter)
@@ -510,6 +537,139 @@ class LiveViewWidget(QWidget):
     # ═══ FINE PARTE A — CONTINUA IN PARTE B ═══
     
     # ═══ INIZIO PARTE B — continuazione della classe LiveViewWidget ═══
+
+    # ═══════════════════════════════════════════════════════════
+    # PAINT: OVERLAY CALIBRAZIONE USAF 1951 (dentro contesto zoomato)
+    # ═══════════════════════════════════════════════════════════
+
+    def _paint_usaf_calibration_overlay(self, painter):
+        """
+        Disegna overlay calibrazione USAF 1951:
+        - Cerchi gialli sui bordi sub-pixel rilevati
+        - Linea dimensionale verde con frecce
+        - Label con gap in px e mm/px risultante
+        - Croce rossa sul punto di click
+        Tutto in italiano.
+        """
+        res = self._usaf_calib_result
+        if res is None:
+            return
+
+        if not res.get("ok", False):
+            if "click_x" in res and "click_y" in res:
+                cp = self._image_to_widget_raw(
+                    float(res["click_x"]), float(res["click_y"])
+                )
+                pen = QPen(QColor(255, 60, 60), 2.0)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.drawLine(
+                    QPointF(cp.x() - 15, cp.y()),
+                    QPointF(cp.x() + 15, cp.y()),
+                )
+                painter.drawLine(
+                    QPointF(cp.x(), cp.y() - 15),
+                    QPointF(cp.x(), cp.y() + 15),
+                )
+            return
+
+        profile_y = res["profile_y"]
+        x_lo = res["x_lo"]
+        x_hi = res["x_hi"]
+        e1 = res["edge1_x"]
+        e2 = res["edge2_x"]
+        gap_px = res["gap_px"]
+        mm_per_px = res["mm_per_px"]
+        cx = res.get("click_x", (e1 + e2) / 2)
+        cy = res.get("click_y", profile_y)
+
+        # Linea profilo (rossa)
+        p_lo = self._image_to_widget_raw(float(x_lo), float(profile_y))
+        p_hi = self._image_to_widget_raw(float(x_hi), float(profile_y))
+        pen_profile = QPen(QColor(255, 80, 80), 1.0)
+        pen_profile.setCosmetic(True)
+        painter.setPen(pen_profile)
+        painter.drawLine(p_lo, p_hi)
+
+        # Cerchi gialli sui bordi sub-pixel
+        pe1 = self._image_to_widget_raw(e1, float(profile_y))
+        pe2 = self._image_to_widget_raw(e2, float(profile_y))
+
+        pen_edge = QPen(QColor(255, 220, 0), 2.5)
+        pen_edge.setCosmetic(True)
+        painter.setPen(pen_edge)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(pe1, 8, 8)
+        painter.drawEllipse(pe2, 8, 8)
+
+        # Tick verticali gialli
+        tick_h = 18
+        painter.drawLine(
+            QPointF(pe1.x(), pe1.y() - tick_h),
+            QPointF(pe1.x(), pe1.y() + tick_h),
+        )
+        painter.drawLine(
+            QPointF(pe2.x(), pe2.y() - tick_h),
+            QPointF(pe2.x(), pe2.y() + tick_h),
+        )
+
+        # Linea dimensionale verde
+        arr_y_img = float(profile_y) + 30.0
+        arr_p1 = self._image_to_widget_raw(e1, arr_y_img)
+        arr_p2 = self._image_to_widget_raw(e2, arr_y_img)
+
+        pen_dim = QPen(QColor(0, 220, 100), 2.0)
+        pen_dim.setCosmetic(True)
+        painter.setPen(pen_dim)
+        painter.drawLine(arr_p1, arr_p2)
+
+        # Punte freccia
+        tip = 8.0
+        painter.drawLine(
+            arr_p1,
+            QPointF(arr_p1.x() + tip, arr_p1.y() - tip * 0.5),
+        )
+        painter.drawLine(
+            arr_p1,
+            QPointF(arr_p1.x() + tip, arr_p1.y() + tip * 0.5),
+        )
+        painter.drawLine(
+            arr_p2,
+            QPointF(arr_p2.x() - tip, arr_p2.y() - tip * 0.5),
+        )
+        painter.drawLine(
+            arr_p2,
+            QPointF(arr_p2.x() - tip, arr_p2.y() + tip * 0.5),
+        )
+
+        # Label dimensionale (italiano)
+        mid_x = (arr_p1.x() + arr_p2.x()) / 2.0
+        label_y = arr_p1.y() + 18.0
+
+        font_dim = QFont("Consolas", 9, QFont.Weight.Bold)
+        painter.setFont(font_dim)
+        painter.setPen(QPen(QColor(0, 220, 100)))
+        painter.drawText(QPointF(mid_x - 45, label_y), f"gap = {gap_px:.1f} px")
+
+        # Label mm/px
+        painter.setFont(QFont("Consolas", 8))
+        painter.setPen(QPen(QColor(255, 220, 0)))
+        painter.drawText(QPointF(mid_x - 55, label_y + 16), f"1 px = {mm_per_px:.6f} mm")
+
+        # Croce rossa sul click
+        cp = self._image_to_widget_raw(float(cx), float(cy))
+        pen_cross = QPen(QColor(255, 60, 60), 2.0)
+        pen_cross.setCosmetic(True)
+        painter.setPen(pen_cross)
+        cs = 12
+        painter.drawLine(
+            QPointF(cp.x() - cs, cp.y() - cs),
+            QPointF(cp.x() + cs, cp.y() + cs),
+        )
+        painter.drawLine(
+            QPointF(cp.x() + cs, cp.y() - cs),
+            QPointF(cp.x() - cs, cp.y() + cs),
+        )
 
     # ═══════════════════════════════════════════════════════════
     # PAINT: FOCUS BAR (overlay fisso, coordinate widget)
@@ -777,7 +937,15 @@ class LiveViewWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._manual_mode:
+            if self._usaf_calib_mode:
+                # Click-to-Calibrate: convert to sensor coordinates
+                img_pos = self._widget_to_image(
+                    event.position().x(), event.position().y()
+                )
+                sensor_x = int(round(img_pos.x()))
+                sensor_y = int(round(img_pos.y()))
+                self.calibration_point_clicked.emit(sensor_x, sensor_y)
+            elif self._manual_mode:
                 # Converti click widget → coordinate immagine (con zoom)
                 img_pos = self._widget_to_image(
                     event.position().x(), event.position().y()

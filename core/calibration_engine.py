@@ -12,6 +12,7 @@ Versione: 1.1
 """
 
 import logging
+import cv2
 import numpy as np
 import yaml
 from pathlib import Path
@@ -22,6 +23,17 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CALIBRATION_FILE = Path("data/calibration_data.yaml")
 CALIBRATION_MAX_AGE_DAYS = 30
+
+# ═══════════════════════════════════════════════════════════════
+# COSTANTI CALIBRAZIONE USAF CLICK
+# ═══════════════════════════════════════════════════════════════
+USAF_PROFILE_HALF_X = 150       # ±150px attorno al click → 300px totali
+USAF_GAUSS_KERNEL = (5, 5)
+USAF_GAUSS_SIGMA = 1.0
+USAF_MIN_GRADIENT = 2.0         # soglia minima |gradiente|
+USAF_GRADIENT_THRESHOLD_RATIO = 0.25
+USAF_MIN_GAP_PX = 10.0
+USAF_MAX_GAP_RATIO = 1.5       # gap massimo = half_x * ratio
 
 
 class CalibrationEngine:
@@ -205,6 +217,211 @@ class CalibrationEngine:
         )
 
         self._save()
+
+    # ─── CLICK-TO-CALIBRATE USAF 1951 ─────────────────────────
+
+    @staticmethod
+    def _parabolic_refine(
+        positions: np.ndarray,
+        values: np.ndarray,
+        peak_idx: int,
+    ) -> float:
+        """
+        Raffinamento sub-pixel parabolico a 5 punti attorno a peak_idx.
+        Fitta y = a·x² + b·x + c e restituisce il vertice x = -b/(2a).
+        """
+        if peak_idx < 2 or peak_idx >= len(values) - 2:
+            return float(positions[peak_idx])
+
+        sl = slice(peak_idx - 2, peak_idx + 3)
+        xf = positions[sl].astype(np.float64)
+        yf = values[sl].astype(np.float64)
+
+        if len(xf) < 3:
+            return float(positions[peak_idx])
+
+        try:
+            c = np.polyfit(xf, yf, 2)
+        except (np.linalg.LinAlgError, ValueError):
+            return float(positions[peak_idx])
+
+        if abs(c[0]) < 1e-15:
+            return float(positions[peak_idx])
+
+        vertex = -c[1] / (2.0 * c[0])
+
+        if abs(vertex - positions[peak_idx]) > 3.0:
+            return float(positions[peak_idx])
+
+        return float(vertex)
+
+    def calibrate_from_usaf_click(
+        self,
+        frame: np.ndarray,
+        click_x: int,
+        click_y: int,
+        known_gap_mm: float = 2.0,
+        half_x: int = USAF_PROFILE_HALF_X,
+    ) -> dict:
+        """
+        Calibrazione Click-to-Calibrate da target USAF 1951 Negativo.
+
+        Algorithm:
+            1. Extract horizontal profile at y=click_y, x in [cx-half_x, cx+half_x]
+            2. Compute signed gradient via np.diff
+            3. Find all FALLING (bright→dark) and RISING (dark→bright) edges
+            4. Find closest Falling→Rising pair to click point
+            5. Sub-pixel parabolic refinement on both edges
+            6. gap_px = rising_x - falling_x
+            7. mm_per_px = known_gap_mm / gap_px
+            8. Update _scale_factor and trigger YAML save
+
+        Args:
+            frame:        Greyscale frame (H×W, uint8) or BGR (H×W×3)
+            click_x:      Click X coordinate in sensor pixels
+            click_y:      Click Y coordinate in sensor pixels
+            known_gap_mm: Physical gap size in mm (default: 2.0)
+            half_x:       Half-width of profile extraction window
+
+        Returns:
+            dict with keys: ok, mm_per_px, gap_px, profile_y, edge1_x, edge2_x,
+            x_lo, x_hi, click_x, click_y, error
+        """
+        if frame.ndim == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        h, w = gray.shape
+
+        result = {
+            "ok": False, "mm_per_px": 0.0, "gap_px": 0.0,
+            "profile_y": click_y, "edge1_x": 0.0, "edge2_x": 0.0,
+            "x_lo": 0, "x_hi": 0, "click_x": click_x, "click_y": click_y,
+            "error": "",
+        }
+
+        if click_y < 0 or click_y >= h or click_x < 0 or click_x >= w:
+            result["error"] = (
+                f"Click ({click_x},{click_y}) fuori dal frame ({w}×{h})"
+            )
+            logger.warning(result["error"])
+            return result
+
+        x_lo = max(0, click_x - half_x)
+        x_hi = min(w - 1, click_x + half_x)
+        result["x_lo"] = x_lo
+        result["x_hi"] = x_hi
+
+        if x_hi - x_lo < 20:
+            result["error"] = (
+                f"Profilo troppo corto: {x_hi - x_lo}px. "
+                f"Click troppo vicino al bordo del frame?"
+            )
+            logger.warning(result["error"])
+            return result
+
+        blurred = cv2.GaussianBlur(gray, USAF_GAUSS_KERNEL, USAF_GAUSS_SIGMA)
+        profile = blurred[click_y, x_lo:x_hi + 1].astype(np.float64)
+        x_coords = np.arange(x_lo, x_hi + 1, dtype=np.float64)
+
+        grad = np.diff(profile)
+        grad_x = x_coords[:-1] + 0.5
+        grad_abs = np.abs(grad)
+
+        if grad_abs.max() < USAF_MIN_GRADIENT:
+            result["error"] = (
+                f"Nessun bordo rilevato al click ({click_x},{click_y}): "
+                f"max|grad|={grad_abs.max():.1f}. "
+                f"Cliccare su uno spazio tra le barre."
+            )
+            logger.warning(result["error"])
+            return result
+
+        thr = USAF_GRADIENT_THRESHOLD_RATIO * grad_abs.max()
+        falling_peaks = []
+        rising_peaks = []
+
+        for i in range(1, len(grad) - 1):
+            is_max = (
+                grad_abs[i] >= grad_abs[i - 1]
+                and grad_abs[i] > grad_abs[i + 1]
+            )
+            if is_max and grad_abs[i] > thr:
+                if grad[i] < 0:
+                    falling_peaks.append(i)
+                else:
+                    rising_peaks.append(i)
+
+        best_pair = None
+        min_dist = np.inf
+        click_idx = click_x - x_lo
+
+        for f_idx in falling_peaks:
+            for r_idx in rising_peaks:
+                if f_idx < r_idx:
+                    gap_width = r_idx - f_idx
+                    if (USAF_MIN_GAP_PX < gap_width
+                            < half_x * USAF_MAX_GAP_RATIO):
+                        gap_center = (f_idx + r_idx) / 2.0
+                        dist = abs(gap_center - click_idx)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_pair = (f_idx, r_idx)
+
+        if best_pair is None:
+            result["error"] = (
+                "Nessuno spazio nero trovato vicino al click. "
+                "Assicurarsi di cliccare al CENTRO di uno spazio tra le barre."
+            )
+            logger.warning(result["error"])
+            return result
+
+        neg_idx, pos_idx = best_pair
+
+        e_neg = self._parabolic_refine(grad_x, grad_abs, neg_idx)
+        e_pos = self._parabolic_refine(grad_x, grad_abs, pos_idx)
+
+        e1 = min(e_neg, e_pos)
+        e2 = max(e_neg, e_pos)
+        gap_px = abs(e2 - e1)
+
+        if gap_px < 3.0:
+            result["error"] = (
+                f"Gap misurato troppo stretto ({gap_px:.1f}px). "
+                f"Cliccare al CENTRO di uno spazio tra le barre."
+            )
+            logger.warning(result["error"])
+            return result
+
+        mm_per_px = known_gap_mm / gap_px
+
+        self._scale_factor = mm_per_px
+        self._cx = float(w / 2.0)
+        self._cy = float(h / 2.0)
+        self._calibration_date = datetime.now()
+        self._is_calibrated = True
+        self._calibration_notes = (
+            f"USAF Click-to-Calibrate: gap={gap_px:.2f}px, "
+            f"click=({click_x},{click_y}), "
+            f"known_gap={known_gap_mm:.3f}mm"
+        )
+
+        self._save()
+
+        result["ok"] = True
+        result["mm_per_px"] = mm_per_px
+        result["gap_px"] = gap_px
+        result["edge1_x"] = e1
+        result["edge2_x"] = e2
+
+        logger.info(
+            f"USAF Click-to-Calibrate OK: "
+            f"gap={gap_px:.2f}px, mm/px={mm_per_px:.6f}, "
+            f"bordi a x={e1:.1f} e x={e2:.1f}"
+        )
+
+        return result
 
     def calibrate_distortion(
         self,

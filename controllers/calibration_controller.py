@@ -26,7 +26,7 @@ from PySide6.QtWidgets import QWidget, QMessageBox
 
 from core.calibration_engine import CalibrationEngine
 from core.metrology_engine import MetrologyEngine
-from views.widgets.live_view_widget import LiveViewWidget
+from views.widgets.live_view_widget import LiveViewWidget, OSDSeverity
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +41,14 @@ class CalibrationRecord:
         operator_id: str = "",
         sample_distance_mm: float = 0.0,
         sample_distance_px: float = 0.0,
+        method: str = "wizard",
     ):
         self.scale_mm_per_px = scale_mm_per_px
         self.timestamp = timestamp
         self.operator_id = operator_id
         self.sample_distance_mm = sample_distance_mm
         self.sample_distance_px = sample_distance_px
+        self.method = method
 
     def __repr__(self) -> str:
         return (
@@ -71,9 +73,11 @@ class CalibrationController(QObject):
     calibration_expired = Signal()
     calibration_status_changed = Signal(bool)
     status_message = Signal(str)
+    usaf_calibration_result = Signal(dict)
 
     # Intervallo controllo scadenza: ogni 5 minuti
     EXPIRY_CHECK_INTERVAL_MS = 5 * 60 * 1000
+    USAF_KNOWN_GAP_MM = 2.0   # Dimensione fisica dello spazio tra le barre del target USAF 1951
 
     def __init__(
         self,
@@ -93,12 +97,23 @@ class CalibrationController(QObject):
 
         self._history: list[CalibrationRecord] = []
         self._grab_worker = None  # Impostato da AcquisitionController
+        self._usaf_click_mode_active: bool = False
 
         # Timer per controllo scadenza periodico
         self._expiry_timer = QTimer(self)
         self._expiry_timer.setInterval(self.EXPIRY_CHECK_INTERVAL_MS)
         self._expiry_timer.timeout.connect(self._check_expiry)
         self._expiry_timer.start()
+
+        # Connessione segnale click calibrazione dal LiveView
+        self._live_view.calibration_point_clicked.connect(
+            self._on_usaf_click_received
+        )
+
+        # Connessione risultato overlay → LiveView
+        self.usaf_calibration_result.connect(
+            self._live_view.set_usaf_calibration_result
+        )
 
         # Se già calibrato all'avvio, registra nello storico
         if self._cal_engine.is_calibrated:
@@ -134,12 +149,126 @@ class CalibrationController(QObject):
     def calibration_count(self) -> int:
         return len(self._history)
 
+    @property
+    def is_usaf_click_mode_active(self) -> bool:
+        return self._usaf_click_mode_active
+
     def set_operator(self, operator_id: str):
         self._operator_id = operator_id
 
     def set_grab_worker(self, worker):
         """Imposta il GrabWorker per il feed frame al wizard."""
         self._grab_worker = worker
+
+    # ═══════════════════════════════════════════════════════════
+    # CLICK-TO-CALIBRATE USAF 1951
+    # ═══════════════════════════════════════════════════════════
+
+    @Slot()
+    def start_usaf_click_calibration(self):
+        """Attiva la modalità Click-to-Calibrate sul LiveView."""
+        self._usaf_click_mode_active = True
+        self._live_view.set_usaf_calibration_mode(True)
+        self.status_message.emit(
+            "🎯 Calibrazione USAF: cliccare al centro di uno spazio tra le barre"
+        )
+        logger.info("Modalità Click-to-Calibrate USAF attivata")
+
+    @Slot()
+    def stop_usaf_click_calibration(self):
+        """Disattiva la modalità Click-to-Calibrate."""
+        self._usaf_click_mode_active = False
+        self._live_view.set_usaf_calibration_mode(False)
+        self.status_message.emit("Calibrazione USAF disattivata")
+        logger.info("Modalità Click-to-Calibrate USAF disattivata")
+
+    @Slot(int, int)
+    def _on_usaf_click_received(self, sensor_x: int, sensor_y: int):
+        """
+        Callback dal LiveView: riceve le coordinate sensore del click.
+        Retrieves the full-res frame, runs calibration, propagates result.
+        """
+        if not self._usaf_click_mode_active:
+            return
+
+        logger.info(
+            f"Click calibrazione USAF ricevuto: ({sensor_x}, {sensor_y})"
+        )
+
+        frame = self._live_view.get_current_frame()
+
+        if frame is None:
+            self._live_view.show_osd_message(
+                "❌ Nessun frame disponibile — avviare la telecamera",
+                OSDSeverity.ERROR, 4000,
+            )
+            logger.error("Click calibrazione USAF: nessun frame disponibile")
+            return
+
+        result = self._cal_engine.calibrate_from_usaf_click(
+            frame=frame,
+            click_x=sensor_x,
+            click_y=sensor_y,
+            known_gap_mm=self.USAF_KNOWN_GAP_MM,
+        )
+
+        self.usaf_calibration_result.emit(result)
+
+        if result["ok"]:
+            mm_per_px = result["mm_per_px"]
+            gap_px = result["gap_px"]
+
+            self._met_engine.set_calibration(
+                scale_mm_per_px=mm_per_px,
+                k1_radial=self._cal_engine.k1_radial,
+                optical_center=self._cal_engine.optical_center,
+            )
+
+            record = CalibrationRecord(
+                scale_mm_per_px=mm_per_px,
+                timestamp=datetime.now(),
+                operator_id=self._operator_id,
+                sample_distance_mm=self.USAF_KNOWN_GAP_MM,
+                sample_distance_px=gap_px,
+                method="usaf_click",
+            )
+            self._history.append(record)
+
+            self.calibration_applied.emit(mm_per_px)
+            self.calibration_status_changed.emit(True)
+            self.status_message.emit(
+                f"✅ Calibrazione USAF completata: {mm_per_px:.6f} mm/px "
+                f"(gap={gap_px:.1f}px)"
+            )
+
+            self._live_view.show_osd_message(
+                f"✅ CALIBRAZIONE RIUSCITA — "
+                f"1 px = {mm_per_px:.6f} mm  |  "
+                f"gap = {gap_px:.1f} px",
+                OSDSeverity.INFO, 6000,
+            )
+
+            logger.info(
+                f"Calibrazione USAF #{len(self._history)} applicata: "
+                f"{mm_per_px:.6f} mm/px (operatore: {self._operator_id})"
+            )
+
+            self._usaf_click_mode_active = False
+            self._live_view.set_usaf_calibration_mode(False)
+
+        else:
+            error_msg = result.get("error", "Errore sconosciuto")
+
+            self._live_view.show_osd_message(
+                f"⚠️ CALIBRAZIONE FALLITA — {error_msg}",
+                OSDSeverity.WARNING, 5000,
+            )
+
+            self.status_message.emit(
+                f"⚠️ Calibrazione USAF fallita: {error_msg}"
+            )
+
+            logger.warning(f"Calibrazione USAF fallita: {error_msg}")
 
     # ═══════════════════════════════════════════════════════════
     # AVVIO CALIBRAZIONE
@@ -155,6 +284,10 @@ class CalibrationController(QObject):
         dal GrabWorker.
         """
         from views.widgets.calibration_wizard import CalibrationWizard
+
+        # Disable USAF click mode if active
+        if self._usaf_click_mode_active:
+            self.stop_usaf_click_calibration()
 
         frame = self._live_view.get_current_frame()
 
@@ -291,12 +424,16 @@ class CalibrationController(QObject):
 
         if self._history:
             lines.append(f"Calibrazioni in sessione: {len(self._history)}")
+            last = self._history[-1]
+            lines.append(f"Ultimo metodo: {last.method}")
 
         return "\n".join(lines)
 
     def cleanup(self):
         """Pulizia risorse."""
         self._expiry_timer.stop()
+        if self._usaf_click_mode_active:
+            self.stop_usaf_click_calibration()
         logger.info(
             f"CalibrationController: cleanup "
             f"({len(self._history)} calibrazioni in sessione)"
