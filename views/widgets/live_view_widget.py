@@ -300,6 +300,7 @@ class LiveViewWidget(QWidget):
                 else Qt.CursorShape.ArrowCursor
             )
             self.clear_persistent_osd()
+            self._usaf_calib_result = None
         self.update()
 
     def set_usaf_calibration_result(self, result: Optional[dict]):
@@ -890,13 +891,13 @@ class LiveViewWidget(QWidget):
     def _draw_osd_centered(self, painter, widget_rect, msg):
         tc = {OSDSeverity.ERROR: Colors.ERROR_RED, OSDSeverity.WARNING: Colors.WARNING_AMBER}.get(msg.severity, Colors.OK_GREEN)
         cx, cy = widget_rect.width() / 2, widget_rect.height() / 2
-        bw = min(550, widget_rect.width() - 120)
-        br = QRectF(cx - bw / 2, cy - 36, bw, 72)
-        painter.setPen(QPen(tc, 3))
+        bw = min(480, widget_rect.width() - 120)
+        br = QRectF(cx - bw / 2, cy - 22, bw, 44)
+        painter.setPen(QPen(tc, 2))
         painter.setBrush(QBrush(Colors.OVERLAY_BG))
-        painter.drawRoundedRect(br, 10, 10)
+        painter.drawRoundedRect(br, 8, 8)
         painter.setPen(QPen(tc))
-        painter.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         painter.drawText(br, Qt.AlignmentFlag.AlignCenter, msg.text)
 
     def _draw_osd_bottom(self, painter, widget_rect, msg, yp):
@@ -941,6 +942,8 @@ class LiveViewWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             # USAF Click-to-Calibrate ha la precedenza sulla misura manuale
             if self._usaf_calib_mode:
+                # Rimuove l'OSD di istruzione appena il click è registrato
+                self.clear_persistent_osd()
                 img_pos = self._widget_to_image(
                     event.position().x(), event.position().y()
                 )

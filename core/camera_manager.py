@@ -201,6 +201,11 @@ class CameraManager:
         """Modalità di simulazione corrente ('bandina' o 'usaf_target')."""
         return self._sim_mode
 
+    @property
+    def is_simulated(self) -> bool:
+        """True se la camera è in modalità simulata (nessun hardware reale)."""
+        return self._simulate
+
     # ═══════════════════════════════════════════════════════════
     # ACQUISIZIONE FRAME
     # ═══════════════════════════════════════════════════════════
