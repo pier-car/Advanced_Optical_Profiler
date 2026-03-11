@@ -48,7 +48,11 @@ from views.widgets.live_view_widget import (
     LiveViewWidget, EdgeOverlayData, OSDSeverity
 )
 
-from config import ROI_ENABLED, ROI_WIDTH, ROI_HEIGHT
+from config import (
+    ROI_ENABLED, ROI_WIDTH, ROI_HEIGHT,
+    METROLOGY_ROI_ENABLED, METROLOGY_ROI_Y_CENTER,
+    METROLOGY_ROI_HEIGHT_PX, UI_UPDATE_EVERY_N_FRAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,8 +217,8 @@ class GrabWorker(QObject):
         self._frame_count: int = 0
         self._measure_every_n: int = 1
         # P1+P7 — Decimazione visual aids: istogramma e nitidezza
-        # ogni N frame (default: 3) per risparmiare ~60-70% CPU
-        self._visual_aids_every_n: int = 3
+        # ogni N frame (default: UI_UPDATE_EVERY_N_FRAMES) per risparmiare ~60-70% CPU
+        self._visual_aids_every_n: int = UI_UPDATE_EVERY_N_FRAMES
         self._fps_timer_start: float = 0.0
         self._fps_frame_count: int = 0
         self._last_fps: float = 0.0
@@ -274,22 +278,28 @@ class GrabWorker(QObject):
                     if (self._frame_count % self._measure_every_n) == 0:
                         try:
                             # --- INIZIO CALCOLO DINAMICO ROI ---
-                            # Lo calcoliamo solo sul primo frame, poi usiamo la memoria
-                            if ROI_ENABLED and self._cached_roi is None:
+                            # Calcolato solo sul primo frame, poi messo in cache
+                            if METROLOGY_ROI_ENABLED and self._cached_roi is None:
                                 frame_h, frame_w = frame.shape[:2]
-                                # Calcola il centro, evitando coordinate negative
-                                roi_x = max(0, (frame_w - ROI_WIDTH) // 2)
-                                roi_y = max(0, (frame_h - ROI_HEIGHT) // 2)
-                                self._cached_roi = (roi_x, roi_y, ROI_WIDTH, ROI_HEIGHT)
-                            
-                            # Decidiamo se passare il ROI in base al file di configurazione
-                            current_roi = self._cached_roi if ROI_ENABLED else None
+                                roi_w = frame_w  # Tutta la larghezza del frame
+                                roi_h = min(METROLOGY_ROI_HEIGHT_PX, frame_h)
+                                roi_x = 0
+                                roi_y = max(
+                                    0,
+                                    int(frame_h * METROLOGY_ROI_Y_CENTER - roi_h // 2)
+                                )
+                                # Clamp per non sforare il frame
+                                roi_y = min(roi_y, frame_h - roi_h)
+                                self._cached_roi = (roi_x, roi_y, roi_w, roi_h)
+
+                            # Decidiamo se passare il ROI in base alla config
+                            current_roi = self._cached_roi if METROLOGY_ROI_ENABLED else None
                             # --- FINE CALCOLO DINAMICO ROI ---
-                            
+
                             # Eseguiamo la misura passando il ROI
                             result = self._engine.measure(frame, roi=current_roi)
                             self.measurement_completed.emit(result)
-                            
+
                         except (ValueError, RuntimeError) as e:
                             logger.debug(f"GrabWorker: misura fallita: {e}")
 
