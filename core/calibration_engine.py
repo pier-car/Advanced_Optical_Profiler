@@ -156,7 +156,8 @@ class CalibrationEngine:
             image_shape:       (height, width) per calcolo centro (API legacy)
         """
         # ── Risolvi i parametri ──────────────────────────────────────────
-        # API legacy: calcola la distanza dai due punti
+        # API legacy: calcola la distanza dai due punti.
+        # np.asarray garantisce la compatibilità con liste Python o tuple.
         if point_a_px is not None and point_b_px is not None:
             distance_px = float(np.linalg.norm(
                 np.asarray(point_b_px, dtype=np.float64)
@@ -167,7 +168,8 @@ class CalibrationEngine:
         if known_distance_mm is not None:
             distance_mm = float(known_distance_mm)
 
-        # API legacy: ricava centro ottico da image_shape
+        # API legacy: ricava centro ottico da image_shape (height, width).
+        # optical_center è (cx, cy) = (width/2, height/2) → indici [1] e [0].
         if image_shape is not None and optical_center is None:
             optical_center = (image_shape[1] / 2.0, image_shape[0] / 2.0)
 
