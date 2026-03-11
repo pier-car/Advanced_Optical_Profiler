@@ -57,6 +57,7 @@ from config import (
     CAMERA_SIMULATE, CAMERA_DEFAULT_EXPOSURE_US, CAMERA_DEFAULT_GAIN_DB,
     CAMERA_EXPOSURE_RANGE, CAMERA_GAIN_RANGE,
     METROLOGY_NUM_SCANLINES, METROLOGY_PROFILE_HALF_LENGTH,
+    METROLOGY_RANSAC_MAX_TRIALS,
     UI_MIN_WINDOW_WIDTH, UI_MIN_WINDOW_HEIGHT,
     UI_LEFT_PANEL_MIN_WIDTH, UI_LEFT_PANEL_MAX_WIDTH,
     UI_LIVE_VIEW_MIN_HEIGHT, UI_STATS_PANEL_MIN_HEIGHT, UI_TABLE_MIN_HEIGHT,
@@ -79,6 +80,7 @@ class MainWindow(QMainWindow):
         self._metrology_engine = MetrologyEngine(PipelineConfig(
             num_scanlines=METROLOGY_NUM_SCANLINES,
             profile_half_length=METROLOGY_PROFILE_HALF_LENGTH,
+            ransac_max_trials=METROLOGY_RANSAC_MAX_TRIALS,
         ))
         self._calibration_engine = CalibrationEngine()
         # commento per togliere il loading della calibrazione. ad ogni avvio deve necessariamente ricalibrare
@@ -530,6 +532,11 @@ class MainWindow(QMainWindow):
             self._status_bar_widget.show_message
         )
 
+        # ── Toolbar — Live ──
+        self._act_start_grab.toggled.connect(
+            self._on_toggle_grabbing_from_toolbar
+        )
+
         # ── Toolbar — Misura ──
         self._act_auto_measure.toggled.connect(
             self._on_toggle_auto_measure
@@ -662,7 +669,10 @@ class MainWindow(QMainWindow):
             self._act_start_grab.setEnabled(True)
         else:
             self._act_start_grab.setEnabled(False)
+            self._act_start_grab.blockSignals(True)
             self._act_start_grab.setChecked(False)
+            self._act_start_grab.setText("▶  Avvia Live")
+            self._act_start_grab.blockSignals(False)
             self._act_auto_measure.setEnabled(False)
             self._act_auto_measure.setChecked(False)
             self._act_auto_trigger.setEnabled(False)

@@ -52,6 +52,7 @@ from config import (
     ROI_ENABLED, ROI_WIDTH, ROI_HEIGHT,
     METROLOGY_ROI_ENABLED, METROLOGY_ROI_Y_CENTER,
     METROLOGY_ROI_HEIGHT_PX, UI_UPDATE_EVERY_N_FRAMES,
+    METROLOGY_MEASURE_EVERY_N_FRAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -200,12 +201,17 @@ class GrabWorker(QObject):
     histogram_ready = Signal(np.ndarray)
     sharpness_ready = Signal(float)
     error_occurred = Signal(str)
+    camera_lost = Signal()  # emesso quando la camera si disconnette fisicamente
+
+    # Numero massimo di errori consecutivi prima di considerare la camera persa
+    _MAX_CONSECUTIVE_ERRORS: int = 5
 
     def __init__(
         self,
         camera_manager: CameraManager,
         metrology_engine: MetrologyEngine,
         image_processor: Optional[ImageProcessor] = None,
+        measure_every_n: int = 1,
     ):
         super().__init__()
         self._camera = camera_manager
@@ -215,13 +221,14 @@ class GrabWorker(QObject):
         self._running: bool = False
         self._auto_measure: bool = False
         self._frame_count: int = 0
-        self._measure_every_n: int = 1
+        self._measure_every_n: int = max(1, measure_every_n)
         # P1+P7 — Decimazione visual aids: istogramma e nitidezza
         # ogni N frame (default: UI_UPDATE_EVERY_N_FRAMES) per risparmiare ~60-70% CPU
         self._visual_aids_every_n: int = UI_UPDATE_EVERY_N_FRAMES
         self._fps_timer_start: float = 0.0
         self._fps_frame_count: int = 0
         self._last_fps: float = 0.0
+        self._consecutive_errors: int = 0
 
         self._cached_roi = None  # Cache per il ROI calcolato dinamicamente
 
@@ -230,6 +237,7 @@ class GrabWorker(QObject):
         self._running = True
         self._fps_timer_start = time.perf_counter()
         self._fps_frame_count = 0
+        self._consecutive_errors = 0
         logger.info("GrabWorker: loop avviato")
 
         while self._running:
@@ -238,6 +246,9 @@ class GrabWorker(QObject):
                 if frame is None:
                     time.sleep(0.01)
                     continue
+
+                # Frame acquisito con successo — azzera il contatore errori
+                self._consecutive_errors = 0
 
                 self._frame_count += 1
                 self._fps_frame_count += 1
@@ -305,8 +316,21 @@ class GrabWorker(QObject):
                             logger.debug(f"GrabWorker: misura fallita: {e}")
 
             except Exception as e:
-                logger.error(f"GrabWorker: errore: {e}")
+                self._consecutive_errors += 1
+                logger.error(
+                    f"GrabWorker: errore "
+                    f"({self._consecutive_errors}/"
+                    f"{self._MAX_CONSECUTIVE_ERRORS}): {e}"
+                )
                 self.error_occurred.emit(str(e))
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                    logger.error(
+                        "GrabWorker: troppi errori consecutivi — "
+                        "camera fisicamente disconnessa"
+                    )
+                    self._running = False
+                    self.camera_lost.emit()
+                    break
                 time.sleep(0.1)
 
         logger.info("GrabWorker: loop terminato")
@@ -522,6 +546,7 @@ class AcquisitionController(QObject):
             camera_manager=self._camera,
             metrology_engine=self._engine,
             image_processor=self._image_processor,  # P8
+            measure_every_n=METROLOGY_MEASURE_EVERY_N_FRAMES,
         )
         self._grab_worker.moveToThread(self._grab_thread)
 
@@ -545,6 +570,10 @@ class AcquisitionController(QObject):
         )
         self._grab_worker.error_occurred.connect(
             self._on_worker_error,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self._grab_worker.camera_lost.connect(
+            self._on_camera_lost,
             type=Qt.ConnectionType.QueuedConnection
         )
 
@@ -858,6 +887,31 @@ class AcquisitionController(QObject):
             f"ERRORE: {error_msg}", OSDSeverity.ERROR, 5000
         )
         self.status_message.emit(f"❌ {error_msg}")
+
+    @Slot()
+    def _on_camera_lost(self):
+        """
+        Chiamato quando il GrabWorker rileva la disconnessione
+        fisica della camera (troppi errori consecutivi).
+
+        Ferma il thread in modo pulito e aggiorna tutta la UI.
+        """
+        logger.error(
+            "AcquisitionController: camera persa — "
+            "fermo l'acquisizione e notifico la UI"
+        )
+        # Il worker ha già settato _running=False e si è fermato.
+        # Usiamo stop_grabbing() per pulire thread e stato.
+        self.stop_grabbing()
+        # Notifica la UI che la camera è disconnessa
+        self.camera_connected.emit(False)
+        self._live_view.show_osd_message(
+            "📷 TELECAMERA DISCONNESSA — Riconnettere il dispositivo",
+            OSDSeverity.ERROR, 0
+        )
+        self.status_message.emit(
+            "❌ Telecamera disconnessa fisicamente"
+        )
 
     # ═══════════════════════════════════════════════════════════
     # CONTROLLO CAMERA
