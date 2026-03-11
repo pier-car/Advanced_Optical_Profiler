@@ -72,14 +72,14 @@ class ToleranceLimits:
 @dataclass
 class MeasurementRecord:
     """Singola misura registrata con metadati."""
-    index: int
     width_mm: float
-    width_mm_std: float
-    width_px: float
-    angle_deg: float
-    contrast_ratio: float
-    n_scanlines: int
-    timestamp_s: float
+    std_mm: float = 0.0
+    index: int = 0
+    width_px: float = 0.0
+    angle_deg: float = 0.0
+    contrast_ratio: float = 0.0
+    n_scanlines: int = 0
+    timestamp_s: float = 0.0
     is_within_tolerance: bool = True
     is_excluded: bool = False
 
@@ -266,20 +266,29 @@ class StatisticsModel(QObject):
 
     def set_tolerance(
         self,
-        nominal_mm: float,
-        upper_limit_mm: float,
-        lower_limit_mm: float
+        tolerance_or_nominal,
+        upper_limit_mm: float = float('inf'),
+        lower_limit_mm: float = float('-inf'),
     ):
         """
         Imposta i limiti di tolleranza e ricalcola la conformità
         di tutte le misure esistenti.
+
+        Accetta due firme:
+            set_tolerance(ToleranceLimits(...))
+            set_tolerance(nominal_mm, upper_limit_mm, lower_limit_mm)
         """
-        with QMutexLocker(self._mutex):
-            self._tolerance = ToleranceLimits(
-                nominal_mm=nominal_mm,
+        if isinstance(tolerance_or_nominal, ToleranceLimits):
+            new_tol = tolerance_or_nominal
+        else:
+            new_tol = ToleranceLimits(
+                nominal_mm=float(tolerance_or_nominal),
                 upper_limit_mm=upper_limit_mm,
                 lower_limit_mm=lower_limit_mm,
             )
+
+        with QMutexLocker(self._mutex):
+            self._tolerance = new_tol
 
             # Ricalcola conformità su tutte le misure esistenti
             self._count_ok = 0
@@ -297,8 +306,8 @@ class StatisticsModel(QObject):
                     self._count_nok += 1
 
         logger.info(
-            f"Tolleranze impostate: nominale={nominal_mm:.3f} mm, "
-            f"LSL={lower_limit_mm:.3f} mm, USL={upper_limit_mm:.3f} mm"
+            f"Tolleranze impostate: nominale={new_tol.nominal_mm:.3f} mm, "
+            f"LSL={new_tol.lower_limit_mm:.3f} mm, USL={new_tol.upper_limit_mm:.3f} mm"
         )
 
         self._emit_statistics()
@@ -325,7 +334,7 @@ class StatisticsModel(QObject):
     def add_measurement(
         self,
         width_mm: float,
-        width_mm_std: float,
+        std_mm: float,
         width_px: float,
         angle_deg: float,
         contrast_ratio: float,
@@ -339,7 +348,7 @@ class StatisticsModel(QObject):
 
         Args:
             width_mm:       Larghezza media in mm
-            width_mm_std:   Deviazione standard in mm
+            std_mm:         Deviazione standard in mm
             width_px:       Larghezza media in pixel
             angle_deg:      Angolo medio della bandina
             contrast_ratio: Rapporto di contrasto
@@ -355,7 +364,7 @@ class StatisticsModel(QObject):
             record = MeasurementRecord(
                 index=self._next_index,
                 width_mm=width_mm,
-                width_mm_std=width_mm_std,
+                std_mm=std_mm,
                 width_px=width_px,
                 angle_deg=angle_deg,
                 contrast_ratio=contrast_ratio,
@@ -377,7 +386,7 @@ class StatisticsModel(QObject):
                 self._count_nok += 1
 
         logger.debug(
-            f"Misura #{record.index}: {width_mm:.3f} ± {width_mm_std:.3f} mm "
+            f"Misura #{record.index}: {width_mm:.3f} ± {std_mm:.3f} mm "
             f"({'OK' if is_ok else 'NOK'})"
         )
 
@@ -385,6 +394,29 @@ class StatisticsModel(QObject):
         self._emit_statistics()
 
         return record
+
+    def add_record(self, record: MeasurementRecord) -> MeasurementRecord:
+        """
+        Registra una misura da un MeasurementRecord pre-costruito.
+
+        Convenience wrapper di ``add_measurement`` per i casi in cui il
+        record è già stato costruito (test, import, misure manuali).
+
+        Args:
+            record: MeasurementRecord con almeno ``width_mm`` valorizzato.
+
+        Returns:
+            Il MeasurementRecord effettivamente registrato (con index assegnato).
+        """
+        return self.add_measurement(
+            width_mm=record.width_mm,
+            std_mm=record.std_mm,
+            width_px=record.width_px,
+            angle_deg=record.angle_deg,
+            contrast_ratio=record.contrast_ratio,
+            n_scanlines=record.n_scanlines,
+            timestamp_s=record.timestamp_s,
+        )
 
     def remove_measurement(self, index: int) -> bool:
         """
@@ -455,6 +487,10 @@ class StatisticsModel(QObject):
 
         self.data_cleared.emit()
         self._emit_statistics()
+
+    def clear(self):
+        """Alias di ``clear_all()``."""
+        self.clear_all()
 
     # ═══════════════════════════════════════════════════════════
     # ACCESSO DATI (Thread-safe)
@@ -570,7 +606,7 @@ class StatisticsModel(QObject):
             for record in reversed(self._records):
                 if not record.is_excluded:
                     last_value = record.width_mm
-                    last_std = record.width_mm_std
+                    last_std = record.std_mm
                     break
 
         # Percentuale OK

@@ -199,6 +199,8 @@ class MetrologyEngine:
         self._is_calibrated: bool = False
         # P0.7 — Lock per accesso thread-safe ai parametri di calibrazione
         self._calibration_lock = threading.Lock()
+        # Thread-local per snapshot calibrazione durante measure()
+        self._tls = threading.local()
 
     # ─── Calibrazione ─────────────────────────────────────────
 
@@ -250,8 +252,17 @@ class MetrologyEngine:
             raise ValueError(f"Frame deve essere greyscale 2D, ricevuto shape {frame.shape}")
 
         # P0.7 — Snapshot thread-safe dei parametri di calibrazione.
+        # Acquisisce il lock una sola volta all'inizio e legge tutti i parametri
+        # in variabili locali, così il resto della pipeline usa valori coerenti
+        # anche se set_calibration() viene chiamato da un altro thread.
         with self._calibration_lock:
-            pass
+            scale_mm_per_px = self._scale_mm_per_px
+            k1_radial = self._k1_radial
+            optical_center = self._optical_center
+            is_calibrated = self._is_calibrated
+
+        # Salva il snapshot nel thread-local per l'uso in _px_to_mm()
+        self._tls.cal = (scale_mm_per_px, k1_radial, optical_center, is_calibrated)
 
         # Local-Sense Mode: crop anticipato per eseguire tutta la pipeline
         # sul solo ritaglio ROI. Le coordinate vengono poi ritrasportate
@@ -725,19 +736,35 @@ class MetrologyEngine:
         distance_px: float,
         position_px: Optional[np.ndarray] = None
     ) -> float:
-        """Converte distanza pixel → millimetri con correzione distorsione."""
-        if not self._is_calibrated:
+        """Converte distanza pixel → millimetri con correzione distorsione.
+
+        Usa il snapshot di calibrazione memorizzato nello storage thread-local
+        da ``measure()``, garantendo coerenza per tutta la durata della pipeline
+        anche in caso di chiamata concorrente a ``set_calibration()``.
+        Se il thread-local non è disponibile (chiamata diretta fuori da
+        ``measure()``) legge i valori correnti dell'istanza.
+        """
+        cal = getattr(self._tls, 'cal', None)
+        if cal is not None:
+            scale, k1, center, calibrated = cal
+        else:
+            scale = self._scale_mm_per_px
+            k1 = self._k1_radial
+            center = self._optical_center
+            calibrated = self._is_calibrated
+
+        if not calibrated:
             return 0.0
 
         correction = 1.0
 
-        if position_px is not None and self._k1_radial != 0.0 and self._optical_center is not None:
-            dx = position_px[0] - self._optical_center[0]
-            dy = position_px[1] - self._optical_center[1]
+        if position_px is not None and k1 != 0.0 and center is not None:
+            dx = position_px[0] - center[0]
+            dy = position_px[1] - center[1]
             r2 = dx**2 + dy**2
-            correction = 1.0 + self._k1_radial * r2
+            correction = 1.0 + k1 * r2
 
-        return distance_px * self._scale_mm_per_px * correction
+        return distance_px * scale * correction
 
     # ─── AGGREGAZIONE RISULTATI ────────────────────────────────
 
