@@ -33,7 +33,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QFrame, QLabel, QPushButton, QGroupBox, QToolBar, QMessageBox,
-    QSizePolicy, QCheckBox, QScrollArea
+    QSizePolicy, QCheckBox, QScrollArea, QComboBox
 )
 from PySide6.QtCore import Qt, Signal, Slot, QSize, QTimer
 from PySide6.QtGui import QFont, QAction
@@ -120,6 +120,16 @@ class MainWindow(QMainWindow):
             statistics_model=self._statistics_model,
             sessions_dir=SESSIONS_DIR,
             exports_dir=EXPORT_DIR,
+            parent=self,
+        )
+
+        # ── CalibrationController (USAF Click-to-Calibrate) ──
+        from controllers.calibration_controller import CalibrationController
+        self._calibration_controller = CalibrationController(
+            calibration_engine=self._calibration_engine,
+            metrology_engine=self._metrology_engine,
+            live_view=self._live_view,
+            operator_id=self._operator_id,
             parent=self,
         )
 
@@ -221,6 +231,56 @@ class MainWindow(QMainWindow):
         self._btn_calibrate = QPushButton("🎯  Nuova Calibrazione")
         self._btn_calibrate.setMinimumHeight(32)
         call.addWidget(self._btn_calibrate)
+
+        # ── Calibrazione Rapida USAF ──
+        usaf_separator = QLabel("─── Calibrazione Rapida USAF ───")
+        usaf_separator.setFont(QFont("Segoe UI", 8))
+        usaf_separator.setStyleSheet("color:#9CA3AF;")
+        usaf_separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        call.addWidget(usaf_separator)
+
+        # Selettore gruppo
+        group_row = QHBoxLayout()
+        group_row.setSpacing(6)
+        lbl_group = QLabel("Gruppo:")
+        lbl_group.setFont(QFont("Segoe UI", 9))
+        group_row.addWidget(lbl_group)
+        self._combo_usaf_group = QComboBox()
+        from core.usaf_target import USAF_GROUPS, USAF_ELEMENTS
+        for g in USAF_GROUPS:
+            self._combo_usaf_group.addItem(f"G{g}", g)
+        self._combo_usaf_group.setCurrentIndex(0)
+        group_row.addWidget(self._combo_usaf_group)
+        call.addLayout(group_row)
+
+        # Selettore elemento
+        elem_row = QHBoxLayout()
+        elem_row.setSpacing(6)
+        lbl_elem = QLabel("Elemento:")
+        lbl_elem.setFont(QFont("Segoe UI", 9))
+        elem_row.addWidget(lbl_elem)
+        self._combo_usaf_element = QComboBox()
+        for e in USAF_ELEMENTS:
+            self._combo_usaf_element.addItem(f"E{e}", e)
+        self._combo_usaf_element.setCurrentIndex(0)
+        elem_row.addWidget(self._combo_usaf_element)
+        call.addLayout(elem_row)
+
+        # Etichetta dimensione (mostra la larghezza fisica per la selezione corrente)
+        self._lbl_usaf_dimension = QLabel("Larghezza barra: 0.2500 mm")
+        self._lbl_usaf_dimension.setFont(QFont("Consolas", 8))
+        self._lbl_usaf_dimension.setStyleSheet("color:#6B7280;")
+        call.addWidget(self._lbl_usaf_dimension)
+
+        # Pulsante calibrazione USAF (checkable)
+        self._btn_usaf_calib = QPushButton("📐 Calibrazione USAF (Click)")
+        self._btn_usaf_calib.setCheckable(True)
+        self._btn_usaf_calib.setMinimumHeight(32)
+        self._btn_usaf_calib.setToolTip(
+            "Calibrazione rapida: clicca su un gap del target USAF 1951"
+        )
+        call.addWidget(self._btn_usaf_calib)
+
         ll.addWidget(calg)
 
         # ── Prova di Misura ──
@@ -596,6 +656,24 @@ class MainWindow(QMainWindow):
             self._on_calibration_required
         )
 
+        # ── USAF Click-to-Calibrate ──
+        self._btn_usaf_calib.toggled.connect(self._on_usaf_calib_toggled)
+        self._combo_usaf_group.currentIndexChanged.connect(
+            self._on_usaf_selection_changed
+        )
+        self._combo_usaf_element.currentIndexChanged.connect(
+            self._on_usaf_selection_changed
+        )
+        self._calibration_controller.calibration_applied.connect(
+            self._on_calibration_done
+        )
+        self._calibration_controller.calibration_applied.connect(
+            lambda _: self._btn_usaf_calib.setChecked(False)
+        )
+        self._calibration_controller.status_message.connect(
+            self._status_bar_widget.show_message
+        )
+
         # ── AcquisitionController → flusso dati misura ──
         self._acquisition_controller.measure_captured.connect(
             self._measurement_controller.on_measure_captured
@@ -847,6 +925,36 @@ class MainWindow(QMainWindow):
         self._act_auto_trigger.setChecked(False)
         self._act_auto_trigger.blockSignals(False)
 
+    @Slot(bool)
+    def _on_usaf_calib_toggled(self, checked: bool):
+        if checked:
+            group = self._combo_usaf_group.currentData()
+            element = self._combo_usaf_element.currentData()
+            self._calibration_controller.set_usaf_group_element(group, element)
+            self._calibration_controller.start_usaf_click_calibration()
+            # Passa la camera simulata alla modalità USAF target
+            self._camera_manager.set_simulation_mode("usaf_target")
+        else:
+            self._calibration_controller.stop_usaf_click_calibration()
+            # Ripristina la camera simulata alla modalità bandina
+            self._camera_manager.set_simulation_mode("bandina")
+
+    @Slot()
+    def _on_usaf_selection_changed(self):
+        """Aggiorna l'etichetta dimensione quando cambia gruppo/elemento."""
+        from core.usaf_target import usaf_line_width_mm
+        group = self._combo_usaf_group.currentData()
+        element = self._combo_usaf_element.currentData()
+        if group is not None and element is not None:
+            try:
+                w_mm = usaf_line_width_mm(group, element)
+                self._lbl_usaf_dimension.setText(f"Larghezza barra: {w_mm:.4f} mm")
+            except ValueError:
+                pass
+            # Aggiorna il controller se la modalità è attiva
+            if self._btn_usaf_calib.isChecked():
+                self._calibration_controller.set_usaf_group_element(group, element)
+
     @Slot()
     def _on_calibrate(self):
         from views.widgets.calibration_wizard import CalibrationWizard
@@ -885,6 +993,8 @@ class MainWindow(QMainWindow):
         if self._acquisition_controller._is_grabbing:
             self._act_auto_measure.setEnabled(True)
             self._act_single_measure.setEnabled(True)
+        # Ripristina la camera simulata alla modalità bandina
+        self._camera_manager.set_simulation_mode("bandina")
 
     def _update_calibration_ui(self):
         cal = self._calibration_engine
@@ -1080,6 +1190,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             logger.info("Chiusura applicazione")
+            self._calibration_controller.cleanup()
             self._session_controller.cleanup()
             self._measurement_controller.cleanup()
             self._acquisition_controller.cleanup()

@@ -71,11 +71,13 @@ class CameraManager:
         self._sim_frame_counter: int = 0
         self._sim_width: int = 3840
         self._sim_height: int = 2748
+        self._sim_mode: str = "bandina"  # "bandina" o "usaf_target"
 
         # P6 — Buffer pre-allocati per ridurre la pressione sul GC
         # (~10MB di allocazione eliminata per frame in modalità simulata)
         self._sim_frame_buf: Optional[np.ndarray] = None
         self._sim_rng = np.random.default_rng()  # RNG moderno (più veloce)
+        self._sim_usaf_cache: Optional[np.ndarray] = None  # Cache target USAF statico
 
         if self._simulate:
             logger.info("CameraManager inizializzato in MODALITÀ SIMULATA")
@@ -177,6 +179,29 @@ class CameraManager:
         return self._device_info
 
     # ═══════════════════════════════════════════════════════════
+    # MODALITÀ SIMULAZIONE
+    # ═══════════════════════════════════════════════════════════
+
+    def set_simulation_mode(self, mode: str):
+        """
+        Cambia la modalità di generazione frame simulati.
+
+        Args:
+            mode: "bandina" — striscia nera oscillante su sfondo bianco
+                  "usaf_target" — target USAF 1951 sintetico
+        """
+        if mode in ("bandina", "usaf_target"):
+            self._sim_mode = mode
+            logger.info(f"Modalità simulazione: {mode}")
+        else:
+            logger.warning(f"Modalità simulazione sconosciuta: {mode!r}")
+
+    @property
+    def simulation_mode(self) -> str:
+        """Modalità di simulazione corrente ('bandina' o 'usaf_target')."""
+        return self._sim_mode
+
+    # ═══════════════════════════════════════════════════════════
     # ACQUISIZIONE FRAME
     # ═══════════════════════════════════════════════════════════
 
@@ -251,6 +276,9 @@ class CameraManager:
         """
         self._sim_frame_counter += 1
 
+        if self._sim_mode == "usaf_target":
+            return self._generate_usaf_frame()
+
         # Alloca il buffer al primo utilizzo (lazy init).
         # int16 per consentire l'addizione di rumore con segno senza overflow
         # prima del clip finale; il frame restituito è uint8.
@@ -289,6 +317,22 @@ class CameraManager:
         np.clip(self._sim_frame_buf, 0, 255, out=self._sim_frame_buf)
 
         return self._sim_frame_buf.astype(np.uint8)
+
+    def _generate_usaf_frame(self) -> np.ndarray:
+        """
+        Genera (o restituisce dalla cache) un frame del target USAF 1951 sintetico.
+
+        Il target è statico: viene generato una sola volta e poi cachato
+        per evitare ricalcoli costosi a ogni frame.
+        """
+        if self._sim_usaf_cache is None:
+            from core.usaf_target import generate_synthetic_usaf_target
+            self._sim_usaf_cache = generate_synthetic_usaf_target(
+                width=self._sim_width,
+                height=self._sim_height,
+            )
+            logger.info("Frame USAF 1951 sintetico generato e cachato")
+        return self._sim_usaf_cache.copy()
 
     # ═══════════════════════════════════════════════════════════
     # CONTROLLO PARAMETRI
