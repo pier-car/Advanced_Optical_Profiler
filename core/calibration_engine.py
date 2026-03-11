@@ -20,7 +20,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CALIBRATION_FILE = Path("data/calibration_data.yaml")
+_DEFAULT_CALIBRATION_FILE = Path("data/calibration_data.yaml")
 CALIBRATION_MAX_AGE_DAYS = 30
 
 
@@ -32,19 +32,39 @@ class CalibrationEngine:
         cal = CalibrationEngine()
         cal.load()  # Carica calibrazione precedente se esiste
 
-        # Oppure calibra da zero:
+        # Oppure calibra da zero (API semplificata):
+        cal.calibrate_from_known_distance(
+            distance_px=800.0,
+            distance_mm=20.0,
+            optical_center=(1920.0, 1080.0),
+        )
+
+        # Oppure con i due punti (API legacy — CalibrationWizard):
         cal.calibrate_from_known_distance(
             point_a_px=np.array([100, 500]),
             point_b_px=np.array([900, 500]),
             known_distance_mm=14.6,
-            image_shape=(2748, 3840)
+            image_shape=(2748, 3840),
         )
 
         # Converti
         mm = cal.px_to_mm(distance_px=523.7)
     """
 
-    def __init__(self):
+    def __init__(self, calibration_dir: Optional[str] = None):
+        """
+        Args:
+            calibration_dir: Directory dove salvare/caricare il file YAML di
+                             calibrazione. Se None, usa il percorso di default
+                             ``data/calibration_data.yaml``.
+        """
+        if calibration_dir is not None:
+            cal_dir = Path(calibration_dir)
+            cal_dir.mkdir(parents=True, exist_ok=True)
+            self._calibration_file = cal_dir / "calibration_data.yaml"
+        else:
+            self._calibration_file = _DEFAULT_CALIBRATION_FILE
+
         self._scale_factor: float = 0.0         # mm/pixel
         self._k1_radial: float = 0.0            # Coefficiente distorsione radiale
         self._cx: float = 0.0                    # Centro ottico x
@@ -97,41 +117,91 @@ class CalibrationEngine:
 
     def calibrate_from_known_distance(
         self,
-        point_a_px: np.ndarray,
-        point_b_px: np.ndarray,
-        known_distance_mm: float,
-        image_shape: tuple
+        distance_px: float = 0.0,
+        distance_mm: float = 0.0,
+        optical_center: Optional[tuple] = None,
+        # Backward-compatible keyword args used by CalibrationWizard
+        point_a_px: Optional[np.ndarray] = None,
+        point_b_px: Optional[np.ndarray] = None,
+        known_distance_mm: Optional[float] = None,
+        image_shape: Optional[tuple] = None,
     ):
         """
-        Calibrazione lineare da due punti a distanza nota.
+        Calibrazione lineare da distanza nota.
 
-        Per il target USAF 1951 Negativo:
-        - L'operatore identifica due feature a distanza nota
-        - scale_factor = D_mm / D_px [mm/pixel]
+        Supporta due API:
+
+        **API semplificata** (nuova):
+            cal.calibrate_from_known_distance(
+                distance_px=800.0,
+                distance_mm=20.0,
+                optical_center=(cx, cy),   # opzionale
+            )
+
+        **API con due punti** (legacy — CalibrationWizard):
+            cal.calibrate_from_known_distance(
+                point_a_px=np.array([x1, y1]),
+                point_b_px=np.array([x2, y2]),
+                known_distance_mm=14.6,
+                image_shape=(height, width),  # opzionale
+            )
 
         Args:
-            point_a_px: Primo punto [x, y] in pixel
-            point_b_px: Secondo punto [x, y] in pixel
-            known_distance_mm: Distanza nota in mm
-            image_shape: (height, width) dell'immagine
+            distance_px:       Distanza in pixel già calcolata (API nuova)
+            distance_mm:       Distanza nota in mm (API nuova)
+            optical_center:    Centro ottico (cx, cy) in pixel (API nuova)
+            point_a_px:        Primo punto [x, y] in pixel (API legacy)
+            point_b_px:        Secondo punto [x, y] in pixel (API legacy)
+            known_distance_mm: Distanza nota in mm (API legacy)
+            image_shape:       (height, width) per calcolo centro (API legacy)
         """
-        dist_px = float(np.linalg.norm(point_b_px - point_a_px))
+        # ── Risolvi i parametri ──────────────────────────────────────────
+        # API legacy: calcola la distanza dai due punti.
+        # np.asarray garantisce la compatibilità con liste Python o tuple.
+        if point_a_px is not None and point_b_px is not None:
+            distance_px = float(np.linalg.norm(
+                np.asarray(point_b_px, dtype=np.float64)
+                - np.asarray(point_a_px, dtype=np.float64)
+            ))
 
-        if dist_px < 10:
-            raise ValueError("Distanza in pixel troppo piccola per calibrazione affidabile")
+        # API legacy: usa known_distance_mm se distance_mm non è fornito
+        if known_distance_mm is not None:
+            distance_mm = float(known_distance_mm)
 
-        if known_distance_mm <= 0:
-            raise ValueError("La distanza nota deve essere positiva")
+        # API legacy: ricava centro ottico da image_shape (height, width).
+        # optical_center è (cx, cy) = (width/2, height/2) → indici [1] e [0].
+        if image_shape is not None and optical_center is None:
+            optical_center = (image_shape[1] / 2.0, image_shape[0] / 2.0)
 
-        self._scale_factor = known_distance_mm / dist_px
-        self._cy = image_shape[0] / 2.0
-        self._cx = image_shape[1] / 2.0
+        # ── Validazione ──────────────────────────────────────────────────
+        if distance_px < 10:
+            raise ValueError(
+                "Distanza in pixel troppo piccola per calibrazione affidabile "
+                f"({distance_px:.1f} px; minimo 10 px)"
+            )
+
+        if distance_mm <= 0:
+            raise ValueError(
+                "La distanza nota deve essere positiva "
+                f"(ricevuto {distance_mm:.3f} mm)"
+            )
+
+        # ── Calcolo fattore di scala ─────────────────────────────────────
+        self._scale_factor = distance_mm / distance_px
+
+        if optical_center is not None:
+            self._cx = float(optical_center[0])
+            self._cy = float(optical_center[1])
+        else:
+            self._cx = 0.0
+            self._cy = 0.0
+
         self._calibration_date = datetime.now()
         self._is_calibrated = True
 
         logger.info(
             f"Calibrazione completata: {self._scale_factor:.6f} mm/px "
-            f"({dist_px:.1f} px = {known_distance_mm:.3f} mm)"
+            f"({distance_px:.1f} px = {distance_mm:.3f} mm)"
         )
 
         self._save()
@@ -194,7 +264,11 @@ class CalibrationEngine:
             raise RuntimeError("Sistema non calibrato!")
         return distance_mm / self._scale_factor
 
-    # ─── PERSISTENZA ──────────────────────────────────────��────
+    # ─── PERSISTENZA ──────────────────────────────────────────────
+
+    def save(self):
+        """Salva la calibrazione su file YAML (metodo pubblico)."""
+        self._save()
 
     def _save(self):
         """Salva la calibrazione su file YAML."""
@@ -207,10 +281,10 @@ class CalibrationEngine:
             'notes': self._calibration_notes,
         }
         try:
-            CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CALIBRATION_FILE, 'w', encoding='utf-8') as f:
+            self._calibration_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._calibration_file, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, default_flow_style=False)
-            logger.info(f"Calibrazione salvata in {CALIBRATION_FILE}")
+            logger.info(f"Calibrazione salvata in {self._calibration_file}")
         except IOError as e:
             logger.error(f"Errore salvataggio calibrazione: {e}")
 
@@ -222,11 +296,11 @@ class CalibrationEngine:
             True se caricata con successo, False altrimenti.
         """
         try:
-            if not CALIBRATION_FILE.exists():
+            if not self._calibration_file.exists():
                 logger.info("Nessun file di calibrazione trovato")
                 return False
 
-            with open(CALIBRATION_FILE, 'r', encoding='utf-8') as f:
+            with open(self._calibration_file, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f)
 
             self._scale_factor = float(data['scale_factor_mm_per_px'])

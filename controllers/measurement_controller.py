@@ -182,7 +182,7 @@ class MeasurementController(QObject):
         # Il model emetterà automaticamente i segnali verso le view
         record = self._model.add_measurement(
             width_mm=result.width_mm_mean,
-            width_mm_std=result.width_mm_std,
+            std_mm=result.width_mm_std,
             width_px=result.width_px_mean,
             angle_deg=result.theta_avg_deg,
             contrast_ratio=result.contrast_ratio,
@@ -207,7 +207,7 @@ class MeasurementController(QObject):
         status_icon = "✅" if record.is_within_tolerance else "❌"
         self.status_message.emit(
             f"{status_icon} Misura #{record.index}: "
-            f"{record.width_mm:.3f} ± {record.width_mm_std:.3f} mm"
+            f"{record.width_mm:.3f} ± {record.std_mm:.3f} mm"
         )
 
     # ═══════════════════════════════════════════════════════════

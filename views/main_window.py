@@ -743,7 +743,7 @@ class MainWindow(QMainWindow):
         # Registra direttamente nel StatisticsModel
         record = self._statistics_model.add_measurement(
             width_mm=dist_mm,
-            width_mm_std=0.0,
+            std_mm=0.0,
             width_px=dist_px,
             angle_deg=0.0,
             contrast_ratio=0.0,
