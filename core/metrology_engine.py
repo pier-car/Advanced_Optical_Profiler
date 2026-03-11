@@ -16,7 +16,6 @@ import numpy as np
 import cv2
 import threading
 from scipy.ndimage import map_coordinates
-from sklearn.linear_model import RANSACRegressor
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum, auto
@@ -87,6 +86,10 @@ class MeasurementResult:
     contrast_ratio: float
     warnings: list[str] = field(default_factory=list)
 
+    # Dati ROI: presenti quando la misura è stata eseguita su un ritaglio
+    roi_used: Optional[tuple[int, int, int, int]] = None
+    offset: tuple[int, int] = (0, 0)
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIGURAZIONE PIPELINE
@@ -130,6 +133,47 @@ class PipelineConfig:
 class MeasurementError(Exception):
     """Eccezione specifica per errori di misurazione."""
     pass
+
+
+def _translate_result_to_global(
+    result: 'MeasurementResult',
+    x_offset: int,
+    y_offset: int,
+) -> None:
+    """
+    Trasla in-place tutte le coordinate di un MeasurementResult
+    dallo spazio locale ROI alle coordinate globali del frame completo.
+
+    Trasformazioni applicate:
+    - EdgeLine.points        → ogni punto traslato di (x_offset, y_offset)
+    - EdgeLine.intercept     → q' = q + y_offset - slope * x_offset
+                               (la retta y=m·x+q in spazio ROI diventa
+                               y=m·x + q' in spazio globale)
+    - ScanlineResult.x_position      → += x_offset
+    - SubPixelEdge.absolute_xy       → += [x_offset, y_offset]
+    """
+    offset_xy = np.array([x_offset, y_offset], dtype=np.float64)
+
+    for edge_line in (result.top_line, result.bottom_line):
+        # Punti bordo
+        if edge_line.points is not None and len(edge_line.points) > 0:
+            edge_line.points = edge_line.points + offset_xy
+
+        # Intercetta della retta y = m*x + q in coordinate globali:
+        # x_global = x_local + x_offset  →  x_local = x_global - x_offset
+        # y_global = y_local + y_offset
+        # y_global = m*(x_global - x_offset) + q + y_offset
+        #          = m*x_global + (q + y_offset - m*x_offset)
+        edge_line.intercept = (
+            edge_line.intercept + y_offset - edge_line.slope * x_offset
+        )
+
+    for sl in result.scanlines:
+        sl.x_position += x_offset
+        if sl.edge_top.absolute_xy is not None:
+            sl.edge_top.absolute_xy = sl.edge_top.absolute_xy + offset_xy
+        if sl.edge_bottom.absolute_xy is not None:
+            sl.edge_bottom.absolute_xy = sl.edge_bottom.absolute_xy + offset_xy
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -198,7 +242,7 @@ class MetrologyEngine:
             roi:   Regione di interesse opzionale (x, y, w, h)
 
         Returns:
-            MeasurementResult con tutti i dati della misurazione
+            MeasurementResult con tutti i dati in coordinate globali full-frame
         """
         if frame is None or frame.size == 0:
             raise ValueError("Frame vuoto o None")
@@ -206,16 +250,22 @@ class MetrologyEngine:
             raise ValueError(f"Frame deve essere greyscale 2D, ricevuto shape {frame.shape}")
 
         # P0.7 — Snapshot thread-safe dei parametri di calibrazione.
-        # Il lock garantisce la visibilità delle ultime scritture effettuate
-        # da set_calibration() in altri thread: il rilascio del lock in
-        # set_calibration() stabilisce un happens-before con questa acquire,
-        # assicurando che _scale_mm_per_px, _k1_radial e _optical_center
-        # siano aggiornati prima di entrare nella pipeline di misura.
         with self._calibration_lock:
             pass
 
-        # Step 1: Preprocessing
-        processed = self._preprocess(frame, roi)
+        # Local-Sense Mode: crop anticipato per eseguire tutta la pipeline
+        # sul solo ritaglio ROI. Le coordinate vengono poi ritrasportate
+        # nello spazio globale (full-frame) prima di costruire il risultato.
+        x_offset, y_offset = 0, 0
+        roi_used = None
+        if roi is not None:
+            x, y, w, h = roi
+            frame = frame[y:y+h, x:x+w]
+            x_offset, y_offset = x, y
+            roi_used = roi
+
+        # Step 1: Preprocessing (il crop è già avvenuto — roi=None)
+        processed = self._preprocess(frame, roi=None)
 
         # Step 2: Segmentazione
         binary = self._segment(processed)
@@ -234,15 +284,25 @@ class MetrologyEngine:
         scanlines = self._measure_scanlines(processed, top_line, bottom_line, theta_avg)
 
         # Step 8: Aggregazione risultati
-        # All'interno di measure(), verso la fine:
         result = self._aggregate_results(
-            top_line, 
-            bottom_line, 
-            theta_avg, 
-            scanlines, 
+            top_line,
+            bottom_line,
+            theta_avg,
+            scanlines,
             processed,
-            cached_binary=binary  
+            cached_binary=binary
         )
+
+        # ─── Traslazione coordinate globali ───────────────────────────
+        # Tutte le coordinate calcolate dalla pipeline sono nello spazio
+        # locale della ROI. Se è stato applicato un crop, le trasliamo
+        # in coordinate globali full-frame prima di restituire il risultato.
+        if x_offset != 0 or y_offset != 0:
+            _translate_result_to_global(result, x_offset, y_offset)
+
+        result.roi_used = roi_used
+        result.offset = (x_offset, y_offset)
+
         return result
 
     # ─── STEP 1: PREPROCESSING ────────────────────────────────
@@ -390,30 +450,41 @@ class MetrologyEngine:
 
     def _fit_ransac(self, edge_points: np.ndarray) -> EdgeLine:
         """
-        Fitta una retta y = m·x + q sui punti del bordo con RANSAC.
+        Fitta una retta y = m·x + q sui punti del bordo.
+
+        Usa cv2.fitLine con metrica DIST_HUBER (robusta agli outlier),
+        ~10-50x più veloce di RANSACRegressor su contorni 4K.
         """
         cfg = self.config
 
-        X = edge_points[:, 0].reshape(-1, 1)
-        y = edge_points[:, 1]
+        pts = edge_points.reshape(-1, 1, 2).astype(np.float32)
+        line = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01)
 
-        ransac = RANSACRegressor(
-            residual_threshold=cfg.ransac_residual_threshold,
-            min_samples=cfg.ransac_min_samples,
-            max_trials=cfg.ransac_max_trials,
-            random_state=42
-        )
-        ransac.fit(X, y)
+        vx, vy, cx, cy = line.flatten()
 
-        m = float(ransac.estimator_.coef_[0])
-        q = float(ransac.estimator_.intercept_)
-        theta = np.arctan(m)
-        inlier_mask = ransac.inlier_mask_
-        inlier_ratio = inlier_mask.sum() / len(inlier_mask)
+        if abs(vx) < 1e-12:
+            # Linea verticale: x = cx  (m = ±inf, intercetta non definita)
+            m = float('inf') if vy > 0 else float('-inf')
+            q = float(cx)   # conservato come "x-intercept" per linee verticali
+            theta = float(np.pi / 2.0)
+            # Distanza da una linea verticale x = cx è semplicemente |xi - cx|
+            residuals = np.abs(edge_points[:, 0] - cx)
+        else:
+            m = float(vy / vx)
+            q = float(cy - m * cx)
+            # Manteniamo l'intervallo [-π/2, π/2] per coerenza con il codice originale
+            theta = float(np.arctan(m))
+            # Distanza punto-retta: |m*xi - yi + q| / sqrt(m²+1)
+            residuals = np.abs(
+                m * edge_points[:, 0] - edge_points[:, 1] + q
+            ) / np.sqrt(m * m + 1.0)
+
+        inlier_mask = residuals < cfg.ransac_residual_threshold
+        inlier_ratio = float(inlier_mask.sum()) / len(inlier_mask)
 
         if inlier_ratio < cfg.min_inlier_ratio:
             logger.warning(
-                f"RANSAC inlier ratio basso: {inlier_ratio:.2%} "
+                f"fitLine inlier ratio basso: {inlier_ratio:.2%} "
                 f"(soglia: {cfg.min_inlier_ratio:.2%})"
             )
 
@@ -421,7 +492,7 @@ class MetrologyEngine:
             slope=m,
             intercept=q,
             angle_rad=theta,
-            angle_deg=np.degrees(theta),
+            angle_deg=float(np.degrees(theta)),
             inlier_ratio=inlier_ratio,
             points=edge_points,
             inlier_mask=inlier_mask,

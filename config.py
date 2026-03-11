@@ -82,6 +82,12 @@ ROI_ENABLED = True
 ROI_WIDTH   = 600    # larghezza ROI in pixel
 ROI_HEIGHT  = 1000   # altezza ROI (deve contenere la bandina + margini)
 
+# ROI avanzata per la pipeline metrologica
+METROLOGY_ROI_ENABLED    = True
+METROLOGY_ROI_Y_CENTER   = 0.5   # Centro della fascia (0.5 = metà altezza)
+METROLOGY_ROI_HEIGHT_PX  = 800   # Altezza della fascia da analizzare [px]
+UI_UPDATE_EVERY_N_FRAMES = 5     # Calcola istogramma/sharpness ogni N frame
+
 # ═══════════════════════════════════════════════════════════════
 # CALIBRAZIONE
 # ═══════════════════════════════════════════════════════════════
