@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QWidget, QMessageBox
 
 from core.calibration_engine import CalibrationEngine
 from core.metrology_engine import MetrologyEngine
+from core.usaf_target import usaf_line_width_mm
 from views.widgets.live_view_widget import LiveViewWidget, OSDSeverity
 
 logger = logging.getLogger(__name__)
@@ -307,7 +308,6 @@ class CalibrationController(QObject):
             return
 
         # Calcola la larghezza del gap nota da gruppo/elemento
-        from core.usaf_target import usaf_line_width_mm
         known_gap_mm = usaf_line_width_mm(self._usaf_group, self._usaf_element)
 
         result = self._cal_engine.calibrate_from_usaf_click(

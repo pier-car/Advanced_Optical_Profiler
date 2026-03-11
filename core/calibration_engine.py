@@ -374,6 +374,9 @@ class CalibrationEngine:
             Posizione sub-pixel del picco nella stessa scala di peak_idx.
         """
         n = len(values)
+        # Richiede almeno 5 elementi per la parabola
+        if n < 5:
+            return float(peak_idx)
         # Garantisce che ci siano almeno 2 campioni su entrambi i lati
         i = int(np.clip(peak_idx, 2, n - 3))
         y = values[i - 2:i + 3].astype(np.float64)
@@ -517,11 +520,11 @@ class CalibrationEngine:
             best_dist = float("inf")
 
             for fi in falling_idxs:
-                # Cerca una salita successiva a questa caduta
-                candidates = rising_idxs[rising_idxs > fi]
-                if len(candidates) == 0:
+                # Usa searchsorted per trovare la prima salita dopo fi in O(log n)
+                insert_pos = int(np.searchsorted(rising_idxs, fi + 1))
+                if insert_pos >= len(rising_idxs):
                     continue
-                ri = candidates[0]
+                ri = rising_idxs[insert_pos]
                 gap_center = (fi + ri) / 2.0
                 dist = abs(gap_center - click_local)
                 if dist < best_dist:

@@ -246,7 +246,8 @@ class MainWindow(QMainWindow):
         lbl_group.setFont(QFont("Segoe UI", 9))
         group_row.addWidget(lbl_group)
         self._combo_usaf_group = QComboBox()
-        for g in range(-2, 8):
+        from core.usaf_target import USAF_GROUPS, USAF_ELEMENTS
+        for g in USAF_GROUPS:
             self._combo_usaf_group.addItem(f"G{g}", g)
         self._combo_usaf_group.setCurrentIndex(0)
         group_row.addWidget(self._combo_usaf_group)
@@ -259,7 +260,7 @@ class MainWindow(QMainWindow):
         lbl_elem.setFont(QFont("Segoe UI", 9))
         elem_row.addWidget(lbl_elem)
         self._combo_usaf_element = QComboBox()
-        for e in range(1, 7):
+        for e in USAF_ELEMENTS:
             self._combo_usaf_element.addItem(f"E{e}", e)
         self._combo_usaf_element.setCurrentIndex(0)
         elem_row.addWidget(self._combo_usaf_element)

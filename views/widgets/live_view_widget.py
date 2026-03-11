@@ -289,9 +289,9 @@ class LiveViewWidget(QWidget):
         self._usaf_calib_mode = active
         if active:
             self.setCursor(Qt.CursorShape.CrossCursor)
-            self.show_osd_message(
+            self.set_persistent_osd(
                 "📐 Modalità calibrazione USAF — Clicca su un gap del target",
-                OSDSeverity.INFO, 0,  # durata 0 = persistente finché non rimosso
+                OSDSeverity.INFO,
             )
         else:
             # Ripristina cursore appropriato
@@ -299,12 +299,7 @@ class LiveViewWidget(QWidget):
                 Qt.CursorShape.CrossCursor if self._manual_mode
                 else Qt.CursorShape.ArrowCursor
             )
-            # Rimuovi i messaggi OSD di calibrazione
-            self._osd_messages = [
-                m for m in self._osd_messages
-                if "calibrazione USAF" not in m.text.lower()
-                and "modalità calibrazione" not in m.text.lower()
-            ]
+            self.clear_persistent_osd()
         self.update()
 
     def set_usaf_calibration_result(self, result: Optional[dict]):
