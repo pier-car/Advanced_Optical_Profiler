@@ -282,13 +282,14 @@ class GrabWorker(QObject):
                             if METROLOGY_ROI_ENABLED and self._cached_roi is None:
                                 frame_h, frame_w = frame.shape[:2]
                                 roi_w = frame_w  # Tutta la larghezza del frame
+                                # roi_h <= frame_h guaranteed by min(), so frame_h - roi_h >= 0
                                 roi_h = min(METROLOGY_ROI_HEIGHT_PX, frame_h)
                                 roi_x = 0
                                 roi_y = max(
                                     0,
                                     int(frame_h * METROLOGY_ROI_Y_CENTER - roi_h // 2)
                                 )
-                                # Clamp per non sforare il frame
+                                # Clamp per non sforare il bordo inferiore del frame
                                 roi_y = min(roi_y, frame_h - roi_h)
                                 self._cached_roi = (roi_x, roi_y, roi_w, roi_h)
 

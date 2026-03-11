@@ -463,16 +463,22 @@ class MetrologyEngine:
         vx, vy, cx, cy = line.flatten()
 
         if abs(vx) < 1e-12:
+            # Linea verticale: x = cx  (m = ±inf, intercetta non definita)
             m = float('inf') if vy > 0 else float('-inf')
-            q = float(cx)
+            q = float(cx)   # conservato come "x-intercept" per linee verticali
+            theta = float(np.pi / 2.0)
+            # Distanza da una linea verticale x = cx è semplicemente |xi - cx|
+            residuals = np.abs(edge_points[:, 0] - cx)
         else:
             m = float(vy / vx)
             q = float(cy - m * cx)
+            # Manteniamo l'intervallo [-π/2, π/2] per coerenza con il codice originale
+            theta = float(np.arctan(m))
+            # Distanza punto-retta: |m*xi - yi + q| / sqrt(m²+1)
+            residuals = np.abs(
+                m * edge_points[:, 0] - edge_points[:, 1] + q
+            ) / np.sqrt(m * m + 1.0)
 
-        theta = float(np.arctan2(vy, vx))
-
-        # Calcolo inlier mask basato sulla distanza residua
-        residuals = np.abs(edge_points[:, 1] - (m * edge_points[:, 0] + q))
         inlier_mask = residuals < cfg.ransac_residual_threshold
         inlier_ratio = float(inlier_mask.sum()) / len(inlier_mask)
 
