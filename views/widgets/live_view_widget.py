@@ -99,6 +99,7 @@ class ManualMeasureResult:
 class LiveViewWidget(QWidget):
     manual_measure_completed = Signal(float, float)
     frame_clicked = Signal(float, float)
+    calibration_point_clicked = Signal(int, int)  # (sensor_x, sensor_y)
 
     FOCUS_BAR_LEFT_MARGIN = 50
     FOCUS_BAR_WIDTH = 22
@@ -143,6 +144,9 @@ class LiveViewWidget(QWidget):
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(16)
         self._flash_timer.timeout.connect(self._animate_flash)
+        # USAF Click-to-Calibrate
+        self._usaf_calib_mode: bool = False
+        self._usaf_calib_result: Optional[dict] = None
         self.setMinimumSize(640, 480)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -275,6 +279,39 @@ class LiveViewWidget(QWidget):
         """Imposta il fattore di scala per le misure manuali."""
         self._calibration_scale = scale_mm_per_px
 
+    def set_usaf_calibration_mode(self, active: bool):
+        """
+        Attiva/disattiva la modalità Click-to-Calibrate USAF 1951.
+
+        Quando attiva, il cursore diventa una croce e il prossimo click
+        sinistro emette il segnale calibration_point_clicked.
+        """
+        self._usaf_calib_mode = active
+        if active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.show_osd_message(
+                "📐 Modalità calibrazione USAF — Clicca su un gap del target",
+                OSDSeverity.INFO, 0,  # durata 0 = persistente finché non rimosso
+            )
+        else:
+            # Ripristina cursore appropriato
+            self.setCursor(
+                Qt.CursorShape.CrossCursor if self._manual_mode
+                else Qt.CursorShape.ArrowCursor
+            )
+            # Rimuovi i messaggi OSD di calibrazione
+            self._osd_messages = [
+                m for m in self._osd_messages
+                if "calibrazione USAF" not in m.text.lower()
+                and "modalità calibrazione" not in m.text.lower()
+            ]
+        self.update()
+
+    def set_usaf_calibration_result(self, result: Optional[dict]):
+        """Memorizza il risultato della calibrazione USAF per l'overlay."""
+        self._usaf_calib_result = result
+        self.update()
+
     def reset_zoom(self):
         self._zoom_factor = 1.0
         self._pan_offset = QPointF(0.0, 0.0)
@@ -368,6 +405,7 @@ class LiveViewWidget(QWidget):
                 self._paint_edge_overlay(painter)
 
             self._paint_manual_measurements(painter)
+            self._paint_usaf_calibration_overlay(painter)
 
             if self._manual_mode:
                 self._paint_manual_in_progress(painter)
@@ -510,6 +548,135 @@ class LiveViewWidget(QWidget):
     # ═══ FINE PARTE A — CONTINUA IN PARTE B ═══
     
     # ═══ INIZIO PARTE B — continuazione della classe LiveViewWidget ═══
+
+    # ═══════════════════════════════════════════════════════════
+    # PAINT: OVERLAY CALIBRAZIONE USAF (dentro contesto zoomato)
+    # ═══════════════════════════════════════════════════════════
+
+    def _paint_usaf_calibration_overlay(self, painter):
+        """
+        Disegna l'overlay del risultato della calibrazione USAF 1951.
+        Deve essere chiamato dentro il blocco painter.save()/restore() zoomato.
+        """
+        result = self._usaf_calib_result
+        if result is None:
+            return
+
+        click_pt = self._image_to_widget_raw(
+            float(result.get("click_x", 0)),
+            float(result.get("click_y", 0)),
+        )
+
+        if not result.get("ok", False):
+            # Croce rossa sul click in caso di errore
+            pen = QPen(QColor(231, 76, 60), 2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            r = 10
+            painter.drawLine(
+                QPointF(click_pt.x() - r, click_pt.y() - r),
+                QPointF(click_pt.x() + r, click_pt.y() + r),
+            )
+            painter.drawLine(
+                QPointF(click_pt.x() + r, click_pt.y() - r),
+                QPointF(click_pt.x() - r, click_pt.y() + r),
+            )
+            return
+
+        # ── Risultato OK ───────────────────────────────────────────────
+        profile_y = float(result.get("profile_y", result.get("click_y", 0)))
+        x_lo = float(result.get("x_lo", 0))
+        x_hi = float(result.get("x_hi", 0))
+        edge1_x = float(result.get("edge1_x", 0))
+        edge2_x = float(result.get("edge2_x", 0))
+        gap_px = float(result.get("gap_px", 0))
+        mm_per_px = float(result.get("mm_per_px", 0))
+
+        p_lo = self._image_to_widget_raw(x_lo, profile_y)
+        p_hi = self._image_to_widget_raw(x_hi, profile_y)
+        p_e1 = self._image_to_widget_raw(edge1_x, profile_y)
+        p_e2 = self._image_to_widget_raw(edge2_x, profile_y)
+
+        # Linea profilo orizzontale (rossa)
+        red_pen = QPen(QColor(231, 76, 60), 1, Qt.PenStyle.DashLine)
+        red_pen.setCosmetic(True)
+        painter.setPen(red_pen)
+        painter.drawLine(p_lo, p_hi)
+
+        # Cerchi gialli sugli edge
+        yellow_pen = QPen(QColor(255, 215, 0), 2)
+        yellow_pen.setCosmetic(True)
+        painter.setPen(yellow_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(p_e1, 8, 8)
+        painter.drawEllipse(p_e2, 8, 8)
+
+        # Tick verticali sugli edge
+        tick_h = 12
+        painter.drawLine(
+            QPointF(p_e1.x(), p_e1.y() - tick_h),
+            QPointF(p_e1.x(), p_e1.y() + tick_h),
+        )
+        painter.drawLine(
+            QPointF(p_e2.x(), p_e2.y() - tick_h),
+            QPointF(p_e2.x(), p_e2.y() + tick_h),
+        )
+
+        # Linea dimensione verde (con punte a freccia) 30px sotto il profilo
+        green_pen = QPen(QColor(46, 204, 113), 2)
+        green_pen.setCosmetic(True)
+        painter.setPen(green_pen)
+        arrow_y = p_e1.y() + 30
+        painter.drawLine(QPointF(p_e1.x(), arrow_y), QPointF(p_e2.x(), arrow_y))
+        # Punte a freccia
+        arr = 6
+        painter.drawLine(
+            QPointF(p_e1.x(), arrow_y),
+            QPointF(p_e1.x() + arr, arrow_y - arr),
+        )
+        painter.drawLine(
+            QPointF(p_e1.x(), arrow_y),
+            QPointF(p_e1.x() + arr, arrow_y + arr),
+        )
+        painter.drawLine(
+            QPointF(p_e2.x(), arrow_y),
+            QPointF(p_e2.x() - arr, arrow_y - arr),
+        )
+        painter.drawLine(
+            QPointF(p_e2.x(), arrow_y),
+            QPointF(p_e2.x() - arr, arrow_y + arr),
+        )
+
+        # Etichetta gap (verde)
+        gap_label = f"distanza = {gap_px:.1f} px"
+        mid_x = (p_e1.x() + p_e2.x()) / 2.0
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(gap_label)
+        painter.setPen(QPen(QColor(46, 204, 113)))
+        painter.drawText(QPointF(mid_x - tw / 2, arrow_y + 16), gap_label)
+
+        # Etichetta scala (gialla)
+        scale_label = f"1 px = {mm_per_px:.6f} mm"
+        painter.setPen(QPen(QColor(255, 215, 0)))
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        fm2 = painter.fontMetrics()
+        tw2 = fm2.horizontalAdvance(scale_label)
+        painter.drawText(QPointF(mid_x - tw2 / 2, arrow_y + 30), scale_label)
+
+        # Croce rossa sul click
+        red_solid = QPen(QColor(231, 76, 60), 2)
+        red_solid.setCosmetic(True)
+        painter.setPen(red_solid)
+        r2 = 8
+        painter.drawLine(
+            QPointF(click_pt.x() - r2, click_pt.y()),
+            QPointF(click_pt.x() + r2, click_pt.y()),
+        )
+        painter.drawLine(
+            QPointF(click_pt.x(), click_pt.y() - r2),
+            QPointF(click_pt.x(), click_pt.y() + r2),
+        )
 
     # ═══════════════════════════════════════════════════════════
     # PAINT: FOCUS BAR (overlay fisso, coordinate widget)
@@ -777,6 +944,13 @@ class LiveViewWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
+            # USAF Click-to-Calibrate ha la precedenza sulla misura manuale
+            if self._usaf_calib_mode:
+                img_pos = self._widget_to_image(
+                    event.position().x(), event.position().y()
+                )
+                self.calibration_point_clicked.emit(int(img_pos.x()), int(img_pos.y()))
+                return
             if self._manual_mode:
                 # Converti click widget → coordinate immagine (con zoom)
                 img_pos = self._widget_to_image(
